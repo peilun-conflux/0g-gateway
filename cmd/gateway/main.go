@@ -16,9 +16,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/johannesboyne/gofakes3"
+
 	"zgs-gateway/internal/chain"
 	"zgs-gateway/internal/object"
-	"zgs-gateway/internal/server"
+	"zgs-gateway/internal/s3gw"
 	"zgs-gateway/internal/store"
 	"zgs-gateway/internal/uploader"
 )
@@ -50,8 +52,6 @@ func main() {
 		nodesCSV      = os.Getenv("ZGS_NODES")
 		ethRPC        = os.Getenv("ZGS_ETH_RPC")
 		privateKey    = os.Getenv("ZGS_PRIVATE_KEY")
-		authSecret    = os.Getenv("ZGS_GW_AUTH_SECRET")
-		adminSecret   = os.Getenv("ZGS_GW_ADMIN_SECRET")
 		maxSize       = envInt("ZGS_GW_MAX_SIZE", 4<<30) // one object = one root: cap at the SDK fragment size
 		batchMax      = int(envInt("ZGS_GW_BATCH_MAX", 20))
 		maxRetries    = int(envInt("ZGS_GW_MAX_RETRIES", 5))
@@ -61,11 +61,12 @@ func main() {
 		slog.Error("ZGS_NODES, ZGS_ETH_RPC and ZGS_PRIVATE_KEY are required")
 		os.Exit(1)
 	}
+	if flushInterval <= 0 {
+		slog.Error("ZGS_GW_FLUSH_INTERVAL_MS must be a positive integer")
+		os.Exit(1)
+	}
 	nodes := strings.Split(nodesCSV, ",")
 	replica := uint(envInt("ZGS_EXPECTED_REPLICA", int64(len(nodes))))
-	if authSecret == "" {
-		slog.Warn("ZGS_GW_AUTH_SECRET empty: object reads are UNAUTHENTICATED")
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -106,9 +107,21 @@ func main() {
 	})
 	go w.Run(ctx, flushInterval)
 
+	// The S3-compatible endpoint (gofakes3) is the gateway's sole interface:
+	// OBS/S3 SDK clients address objects by bucket+key. The handler is wrapped
+	// with Huawei-OBS-style image processing (?x-image-process=image/resize,...).
+	// No signature verification — keep it bound to an internal interface only.
+	s3Backend := s3gw.New(svc, st)
+	faker := gofakes3.New(s3Backend, gofakes3.WithAutoBucket(true))
 	httpSrv := &http.Server{
 		Addr:    listen,
-		Handler: server.New(svc, st, server.Config{AuthSecret: authSecret, AdminSecret: adminSecret}),
+		Handler: s3Backend.ImageProcessHandler(faker.Server()),
+		// ReadHeaderTimeout bounds slow-header (Slowloris) clients without
+		// capping body transfer time, since objects can be multi-GB and take a
+		// while to stream. IdleTimeout reaps idle keep-alive connections.
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 	go func() {
 		<-ctx.Done()
@@ -117,6 +130,7 @@ func main() {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
+	slog.Warn("gateway endpoint is UNAUTHENTICATED (no S3 signature check); bind to an internal interface only", "addr", listen)
 	slog.Info("gateway listening", "addr", listen, "nodes", nodes, "replica", replica)
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("http server", "err", err)

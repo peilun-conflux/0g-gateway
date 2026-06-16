@@ -1,0 +1,9 @@
+{
+  "name": "obs-sdk-compat-test",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Validates the gateway S3 endpoint against the Huawei OBS Node.js SDK",
+  "dependencies": {
+    "esdk-obs-nodejs": "^3.26.2"
+  }
+}

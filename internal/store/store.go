@@ -4,6 +4,7 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,7 +23,24 @@ const (
 	StatusFailed    Status = "failed"    // retries exhausted or pruned
 )
 
-var ErrExists = errors.New("object already exists")
+var (
+	ErrExists         = errors.New("object already exists")
+	ErrBucketExists   = errors.New("bucket already exists")
+	ErrBucketNotFound = errors.New("bucket not found")
+	ErrBucketNotEmpty = errors.New("bucket not empty")
+)
+
+// BucketRecord is the registry entry for one S3-style bucket.
+type BucketRecord struct {
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// S3Object pairs a bucket-relative key with its resolved object metadata.
+type S3Object struct {
+	Key  string
+	Meta ObjectMeta
+}
 
 // ObjectMeta is the metadata record for one stored object, keyed by its 0G
 // merkle root. It is stored as JSON, so adding fields later (e.g. encryption
@@ -30,6 +48,7 @@ var ErrExists = errors.New("object already exists")
 type ObjectMeta struct {
 	Root        string    `json:"root"`
 	SHA256      string    `json:"sha256"`
+	MD5         string    `json:"md5,omitempty"` // hex MD5 of content; S3 ETag for the gofakes3 layer
 	Size        int64     `json:"size"`
 	Filename    string    `json:"filename,omitempty"`
 	ContentType string    `json:"contentType,omitempty"`
@@ -48,6 +67,8 @@ var (
 	bucketSHA      = []byte("sha256")
 	bucketUpload   = []byte("q_upload")   // roots with status pending|submitted
 	bucketFinalize = []byte("q_finalize") // roots with status onchain
+	bucketS3Bkts   = []byte("s3_buckets") // S3 bucket name → BucketRecord(JSON)
+	bucketS3Keys   = []byte("s3_keys")    // "bucket/key" → root (S3 object index)
 )
 
 type Store struct {
@@ -61,7 +82,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bucketObjects, bucketSHA, bucketUpload, bucketFinalize} {
+		for _, b := range [][]byte{bucketObjects, bucketSHA, bucketUpload, bucketFinalize, bucketS3Bkts, bucketS3Keys} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -97,16 +118,21 @@ func getMeta(tx *bolt.Tx, root string) (ObjectMeta, bool, error) {
 	return m, true, nil
 }
 
-// requeue places root in the queue matching its status.
-func requeue(tx *bolt.Tx, root string, st Status) error {
-	key := []byte(root)
+// requeue keeps an object's queue membership in sync with its current state.
+// A deleted object is never (re)enqueued: it must not be uploaded to immutable
+// 0G storage nor polled for finality.
+func requeue(tx *bolt.Tx, m ObjectMeta) error {
+	key := []byte(m.Root)
 	if err := tx.Bucket(bucketUpload).Delete(key); err != nil {
 		return err
 	}
 	if err := tx.Bucket(bucketFinalize).Delete(key); err != nil {
 		return err
 	}
-	switch st {
+	if m.Deleted {
+		return nil
+	}
+	switch m.Status {
 	case StatusPending, StatusSubmitted:
 		return tx.Bucket(bucketUpload).Put(key, []byte{})
 	case StatusOnchain:
@@ -130,7 +156,7 @@ func (s *Store) CreateObject(m ObjectMeta) error {
 		if err := tx.Bucket(bucketSHA).Put([]byte(m.SHA256), []byte(m.Root)); err != nil {
 			return err
 		}
-		return requeue(tx, m.Root, m.Status)
+		return requeue(tx, m)
 	})
 }
 
@@ -178,7 +204,7 @@ func (s *Store) mutate(root string, fn func(*ObjectMeta)) (ObjectMeta, error) {
 			return err
 		}
 		out = m
-		return requeue(tx, root, m.Status)
+		return requeue(tx, m)
 	})
 	return out, err
 }
@@ -222,6 +248,162 @@ func (s *Store) SetSkipTx(root string, v bool) error {
 func (s *Store) MarkDeleted(root string) error {
 	_, err := s.mutate(root, func(m *ObjectMeta) { m.Deleted = true })
 	return err
+}
+
+// Undelete clears the logical-delete flag. Unless the object is already
+// finalized on 0G (in which case the data is still retrievable as-is), it is
+// reset to pending so the cache file is re-uploaded — covering the case where
+// identical content is re-submitted after a delete.
+func (s *Store) Undelete(root string) error {
+	_, err := s.mutate(root, func(m *ObjectMeta) {
+		m.Deleted = false
+		if m.Status != StatusFinalized {
+			m.Status = StatusPending
+			m.Retries = 0
+			m.FailReason = ""
+		}
+	})
+	return err
+}
+
+// --- S3-style bucket + object-key index (gofakes3 layer) ---
+//
+// Object keys are stored in bucketS3Keys under the composed key "bucket/key".
+// S3 bucket names cannot contain "/", so "bucket/" is an unambiguous prefix.
+
+func s3Composite(bucket, key string) []byte { return []byte(bucket + "/" + key) }
+func s3Prefix(bucket string) []byte         { return []byte(bucket + "/") }
+
+// S3CreateBucket registers a bucket. Returns ErrBucketExists if it already does.
+func (s *Store) S3CreateBucket(name string, now time.Time) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketS3Bkts)
+		if b.Get([]byte(name)) != nil {
+			return ErrBucketExists
+		}
+		raw, err := json.Marshal(BucketRecord{Name: name, CreatedAt: now.UTC()})
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(name), raw)
+	})
+}
+
+func (s *Store) S3BucketExists(name string) (bool, error) {
+	var ok bool
+	err := s.db.View(func(tx *bolt.Tx) error {
+		ok = tx.Bucket(bucketS3Bkts).Get([]byte(name)) != nil
+		return nil
+	})
+	return ok, err
+}
+
+func (s *Store) S3ListBuckets() ([]BucketRecord, error) {
+	var out []BucketRecord
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketS3Bkts).ForEach(func(_, v []byte) error {
+			var r BucketRecord
+			if err := json.Unmarshal(v, &r); err != nil {
+				return err
+			}
+			out = append(out, r)
+			return nil
+		})
+	})
+	return out, err
+}
+
+func (s *Store) bucketHasKeys(tx *bolt.Tx, name string) bool {
+	pfx := s3Prefix(name)
+	k, _ := tx.Bucket(bucketS3Keys).Cursor().Seek(pfx)
+	return k != nil && bytes.HasPrefix(k, pfx)
+}
+
+// S3DeleteBucket deletes an empty bucket. ErrBucketNotFound / ErrBucketNotEmpty otherwise.
+func (s *Store) S3DeleteBucket(name string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketS3Bkts)
+		if b.Get([]byte(name)) == nil {
+			return ErrBucketNotFound
+		}
+		if s.bucketHasKeys(tx, name) {
+			return ErrBucketNotEmpty
+		}
+		return b.Delete([]byte(name))
+	})
+}
+
+// S3ForceDeleteBucket deletes a bucket and all its object-key mappings.
+func (s *Store) S3ForceDeleteBucket(name string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketS3Bkts)
+		if b.Get([]byte(name)) == nil {
+			return ErrBucketNotFound
+		}
+		keys := tx.Bucket(bucketS3Keys)
+		c := keys.Cursor()
+		pfx := s3Prefix(name)
+		for k, _ := c.Seek(pfx); k != nil && bytes.HasPrefix(k, pfx); k, _ = c.Next() {
+			if err := keys.Delete(k); err != nil {
+				return err
+			}
+		}
+		return b.Delete([]byte(name))
+	})
+}
+
+// S3PutObjectKey maps bucket/key → root. The bucket's existence is verified in
+// the same transaction as the key write: callers check the bucket earlier (before
+// the slow ingest), but a concurrent bucket delete could land in between, so the
+// authoritative check is here — otherwise a raced delete would leave an orphan
+// key under a non-existent bucket. Returns ErrBucketNotFound if the bucket is gone.
+func (s *Store) S3PutObjectKey(bucket, key, root string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		if tx.Bucket(bucketS3Bkts).Get([]byte(bucket)) == nil {
+			return ErrBucketNotFound
+		}
+		return tx.Bucket(bucketS3Keys).Put(s3Composite(bucket, key), []byte(root))
+	})
+}
+
+func (s *Store) S3GetObjectKey(bucket, key string) (root string, ok bool, err error) {
+	err = s.db.View(func(tx *bolt.Tx) error {
+		if v := tx.Bucket(bucketS3Keys).Get(s3Composite(bucket, key)); v != nil {
+			root, ok = string(v), true
+		}
+		return nil
+	})
+	return root, ok, err
+}
+
+func (s *Store) S3DeleteObjectKey(bucket, key string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketS3Keys).Delete(s3Composite(bucket, key))
+	})
+}
+
+// S3ListObjects returns every live object in the bucket as (key, metadata),
+// resolving each root within the SAME read transaction to avoid N+1 lookups.
+// Deleted objects are skipped; prefix matching for the S3 list request is
+// applied by the caller.
+func (s *Store) S3ListObjects(bucket string) ([]S3Object, error) {
+	var out []S3Object
+	pfx := s3Prefix(bucket)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		c := tx.Bucket(bucketS3Keys).Cursor()
+		for k, v := c.Seek(pfx); k != nil && bytes.HasPrefix(k, pfx); k, v = c.Next() {
+			m, ok, err := getMeta(tx, string(v))
+			if err != nil {
+				return err
+			}
+			if !ok || m.Deleted {
+				continue
+			}
+			out = append(out, S3Object{Key: string(k[len(pfx):]), Meta: m})
+		}
+		return nil
+	})
+	return out, err
 }
 
 func (s *Store) listQueue(bucket []byte, limit int) ([]ObjectMeta, error) {

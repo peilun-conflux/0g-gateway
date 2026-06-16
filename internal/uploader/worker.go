@@ -85,6 +85,17 @@ func (w *Worker) processBatch(ctx context.Context, batch []store.ObjectMeta) err
 	// nodes before re-submitting; fresh pending items skip the extra RPC.
 	items := make([]Item, 0, len(batch))
 	for _, m := range batch {
+		// The queue was snapshotted up front, so re-read each object: a delete
+		// (or other state change) may have landed since. A logically deleted
+		// object must never be uploaded — 0G storage is immutable.
+		cur, ok, err := w.st.Get(m.Root)
+		if err != nil {
+			return err
+		}
+		if !ok || cur.Deleted {
+			continue
+		}
+		m = cur
 		if m.Status == store.StatusSubmitted || m.Retries > 0 {
 			switch st, err := w.ch.FileStatus(ctx, m.Root); {
 			case err != nil:
@@ -120,7 +131,16 @@ func (w *Worker) processBatch(ctx context.Context, batch []store.ObjectMeta) err
 		return err
 	}
 	for _, it := range items {
-		if err := w.st.SetStatus(it.Root, store.StatusOnchain, txHash, ""); err != nil {
+		// SkipTx items were already on chain under their original tx; this
+		// batch only re-uploaded their segments, so keep their recorded txHash
+		// (an empty hash tells SetStatus to leave it untouched) instead of
+		// stamping this batch's hash — which may even be the zero hash for an
+		// all-SkipTx batch that submitted no new transaction.
+		th := txHash
+		if it.SkipTx {
+			th = ""
+		}
+		if err := w.st.SetStatus(it.Root, store.StatusOnchain, th, ""); err != nil {
 			return err
 		}
 	}

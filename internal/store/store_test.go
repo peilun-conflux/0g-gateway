@@ -1,8 +1,10 @@
 package store
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func tempStore(t *testing.T) *Store {
@@ -178,5 +180,84 @@ func TestMarkDeleted(t *testing.T) {
 	got, ok, _ := s.Get("0x01")
 	if !ok || !got.Deleted {
 		t.Fatalf("not marked deleted: %+v ok=%v", got, ok)
+	}
+}
+
+func TestMarkDeletedDropsFromQueues(t *testing.T) {
+	s := tempStore(t)
+	mustCreate(t, s, ObjectMeta{Root: "0x01", SHA256: "a", Status: StatusPending})
+	mustCreate(t, s, ObjectMeta{Root: "0x02", SHA256: "b", Status: StatusPending})
+	if err := s.SetStatus("0x02", StatusOnchain, "0xtx", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// deleting a pending object must remove it from the upload queue so the
+	// worker never uploads it to immutable 0G
+	if err := s.MarkDeleted("0x01"); err != nil {
+		t.Fatal(err)
+	}
+	if q, _ := s.UploadQueue(10); len(q) != 0 {
+		t.Fatalf("deleted pending object still in upload queue: %d", len(q))
+	}
+	// and an onchain object must leave the finalize queue
+	if err := s.MarkDeleted("0x02"); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := s.FinalizeQueue(10); len(f) != 0 {
+		t.Fatalf("deleted onchain object still in finalize queue: %d", len(f))
+	}
+}
+
+func TestUndeleteRequeues(t *testing.T) {
+	s := tempStore(t)
+	mustCreate(t, s, ObjectMeta{Root: "0x01", SHA256: "a", Status: StatusPending})
+	if err := s.MarkDeleted("0x01"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Undelete("0x01"); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ := s.Get("0x01")
+	if got.Deleted || got.Status != StatusPending {
+		t.Fatalf("undelete state: %+v", got)
+	}
+	if q, _ := s.UploadQueue(10); len(q) != 1 {
+		t.Fatalf("undeleted object not re-enqueued: %d", len(q))
+	}
+}
+
+func TestS3PutObjectKeyRequiresBucket(t *testing.T) {
+	s := tempStore(t)
+	// Writing a key under a non-existent bucket is refused in-transaction, so a
+	// bucket delete racing a slow PUT can never leave an orphan key behind.
+	if err := s.S3PutObjectKey("demo", "k", "0x01"); !errors.Is(err, ErrBucketNotFound) {
+		t.Fatalf("want ErrBucketNotFound for missing bucket, got %v", err)
+	}
+	if err := s.S3CreateBucket("demo", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.S3PutObjectKey("demo", "k", "0x01"); err != nil {
+		t.Fatalf("put after create: %v", err)
+	}
+	if root, ok, _ := s.S3GetObjectKey("demo", "k"); !ok || root != "0x01" {
+		t.Fatalf("get after put: root=%q ok=%v", root, ok)
+	}
+}
+
+func TestUndeleteFinalizedStaysFinalized(t *testing.T) {
+	s := tempStore(t)
+	mustCreate(t, s, ObjectMeta{Root: "0x01", SHA256: "a", Status: StatusFinalized})
+	if err := s.MarkDeleted("0x01"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Undelete("0x01"); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ := s.Get("0x01")
+	if got.Deleted || got.Status != StatusFinalized {
+		t.Fatalf("finalized undelete must not reset status: %+v", got)
+	}
+	if q, _ := s.UploadQueue(10); len(q) != 0 {
+		t.Fatalf("finalized object wrongly enqueued for upload: %d", len(q))
 	}
 }

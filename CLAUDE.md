@@ -1,0 +1,156 @@
+# CLAUDE.md — 0G Storage Gateway 维护手册（给 AI agent）
+
+本文件是后续 agent 维护本仓库的权威说明。开工前通读；改代码前先看 §8（约定）和 §9（坑）。
+
+## 1. 这是什么
+
+一个 **S3 兼容的对象存储网关**:对外只说 S3 协议(华为 OBS SDK 等 S3 客户端直连),数据落到
+**0G 去中心化存储**。对调用方屏蔽 0G 细节,把它当 OBS/S3 端点用即可。纯 Go,无外部数据库
+(元数据用内嵌 bbolt)。
+
+寻址:对外是 **S3 桶 + 对象 key**;网关内部是**内容寻址**——对象的真实 key 是内容的 merkle
+root(`0x…`,服务端生成,天然去重 + 可校验)。桶/键 → root 的映射由网关维护,对客户端透明。
+
+> **历史**:早期还有一套原生 HTTP API(`/objects` 内容寻址 + `/kv` key 寻址 + HMAC 签名 URL)。
+> 因「S3 是唯一接入方式」,这套原生 API 连同 `internal/server`、`internal/auth` 已整体删除。
+> 现在唯一对外接口是 `internal/s3gw`(见 §4.5)。
+
+## 2. 包结构与职责
+
+| 包 | 文件 | 职责 |
+|---|---|---|
+| `cmd/gateway` | `main.go` | 进程入口:读 env 配置、装配各组件、起 S3 server 与后台 worker、优雅退出 |
+| `internal/s3gw` | `backend.go`、`imageprocess.go` | **唯一对外接口**:实现 `gofakes3.Backend`,把 S3 桶+键操作映射到 `object.Service`+`store`;`imageprocess.go` 是华为风格 `?x-image-process=image/resize,...` 中间件 |
+| `internal/object` | `service.go` | 摄取/读取管线:spool→sha256(+md5)→去重→merkle root→落缓存→写元数据;冷读回源 |
+| `internal/store` | `store.go` | bbolt 持久化:对象元数据、SHA 索引、两条上传队列、桶注册表 + 桶/键→root 索引;每次状态变更一个事务 |
+| `internal/uploader` | `worker.go` | 后台批量上传 worker:攒批、对账(reconcile)、重试、最终性轮询 |
+| `internal/chain` | `backend.go` | 真实 0G 后端:`BatchUpload` / `FileStatus` / `Download`,封装 0g-storage-client SDK |
+| `internal/imageproc` | `imageproc.go` | `image/resize`(纯标准库:decode→bilinear→encode);被 `s3gw` 图片中间件调用 |
+| `integration` | `e2e_test.go`、`obssdk_test.go` | 打真网的端到端测试(`ZGS_E2E=1`)+ 真实华为 OBS SDK 兼容测试 |
+
+依赖方向:`s3gw → object → store`;`uploader → store`(+ `Chain` 接口);`chain` 实现 `uploader.Chain` 并被 `main` 注入。**`uploader` 不依赖 `chain` 包**(靠接口解耦,便于 fake 测试)。
+
+## 3. 数据模型(bbolt,单文件 `data/meta.db`)
+
+6 个 bucket:
+- `objects`:`root → ObjectMeta(JSON)` —— 唯一真相源
+- `sha256`:`sha256(明文) → root` —— 去重索引
+- `q_upload`:待上传队列(status = pending|submitted 的 root)
+- `q_finalize`:待最终化队列(status = onchain 的 root)
+- `s3_buckets`:`桶名 → BucketRecord(JSON)` —— S3 桶注册表
+- `s3_keys`:`"bucket/key" → root` —— S3 对象索引(纯索引,不碰对象/队列)
+
+`ObjectMeta` 关键字段:`Root, SHA256, Size, Filename, ContentType, Status, TxHash, FailReason, Retries, SkipTx, Deleted, CreatedAt, UpdatedAt`。存 JSON,加字段向后兼容。
+
+**状态机**(`store.Status`):
+```
+pending ──► submitted ──► onchain ──► finalized
+（已缓存，  （已交链后端  （tx 已打包，   （存储节点确认，
+  待上传）    待回执）      待最终性）       终态·成功）
+   └────────────────────────────────► failed（重试耗尽 / 被 prune，终态）
+```
+正交标志:`Deleted`(逻辑删除)、`SkipTx`(对账判定 entry 已在链上,只补传分片)。
+
+队列成员关系由 `store.requeue` 统一维护:**Deleted 的对象永不入队**(见 §9)。`mutate`/`CreateObject` 每次落库都调 `requeue` 保持队列与 status 一致。
+
+## 4. 控制流
+
+### 4.1 摄取 `PUT`(`object.Service.Put`)
+1. 流式写 spool 临时文件,同时算 SHA256(可选 `MaxSize` 用 `LimitReader` 限流)。
+2. 空对象拒绝(`ErrEmpty`);超限拒绝(`ErrTooLarge`)。
+3. **按明文 SHA 去重**:命中且未删除 → 直接返回(dedup)。其中:
+   - 命中对象非 finalized 但**缓存文件丢失** → 用刚写的 spool 救回缓存并重新入队(salvage)。
+   - 命中对象是 `failed` → `Reenqueue` 重试。
+4. 未命中:`fsync` spool → 算 merkle root(`core.MerkleRoot`)→ `rename` 进缓存 `objects/{root}`。
+5. `CreateObject` 写元数据 + SHA 索引 + 入 `q_upload`。
+   - 若 `ErrExists` 且该 root **已被逻辑删除** → `Undelete` 复活(同内容重传即恢复),返回非 dedup。
+   - 若 `ErrExists` 未删除 → 与并发相同 PUT 抢输了,当 dedup 命中。
+
+**崩溃一致性**:缓存文件先 fsync+rename 落地,**再**提交元数据/任务记录。中途崩溃只会留下孤儿缓存文件(无害),不会出现「有任务无数据」。
+
+### 4.2 上传 worker(`uploader.Worker`,后台单 goroutine,`Run` 按 `flushInterval` 循环)
+`Flush`:快照 `q_upload` → 按 `BatchMax` 分批 → `processBatch`:
+- 逐项**重新读库**(快照可能过期),`Deleted` 的跳过(绝不上传)。
+- `submitted`(崩溃残留)或 `Retries>0` 的项,先 `FileStatus` 对账:已 finalized→直接收尾;在链上→置 `SkipTx`;不在链上→清 `SkipTx`。
+- 全部置 `submitted` → `ch.BatchUpload`(一次链上 tx 提交整批)。
+  - 成功:置 `onchain`;**SkipTx 项保留原 txHash**(传空,不被本批 hash 覆盖,见 §9)。
+  - 失败:`reconcileFailedBatch` 逐项对账,涨 `Retries`,超过 `MaxRetries` 置 `failed`,否则回 `pending`。
+
+`PollFinality`:扫 `q_finalize` → `FileStatus`:finalized→`finalized`;pruned→`failed`(告警条件)。
+
+### 4.3 下载 `GET`(`object.Service.Open`)
+1. 元数据不存在→`ErrNotFound`;`Deleted`→`ErrGone`。
+2. **热路径**:缓存文件存在且**大小等于** `meta.Size` → 直接返回(`http.ServeContent` 处理 Range/HEAD/If-Modified-Since)。大小不符视为损坏,丢弃走冷路径。
+3. **冷路径**:从 0G `Download`(**带 merkle proof 校验**)到唯一临时路径 → `rename` 进缓存 → 返回。
+   - 缓存损坏但对象不在 0G(如 pending)→ 冷读失败 → `502`(失败关闭,不返回错误字节)。
+4. **图片预览**:`s3gw.ImageProcessHandler` 中间件(套在 gofakes3 之前)拦截 `GET ...?x-image-process=image/resize,w_,h_,m_`,自己解析桶/键 → `Open` → `imageproc.ResizeReader` → 整体写出(**无 Range、无派生缓存**)。gofakes3 的 `Backend` 看不到任意 query 参数,所以必须做成 HTTP 中间件。其余请求原样透传给 gofakes3。
+
+### 4.4 S3 兼容层(`internal/s3gw` + gofakes3,唯一对外接口)
+为让华为 OBS SDK 等 S3 客户端直接接入(OBS≈S3),用 **gofakes3**(嵌入式库,白嫖 S3 协议:XML/Range/aws-chunked 解码/multipart)+ 我们实现的 `gofakes3.Backend`。
+- 即网关主 server,监听 `ZGS_GW_LISTEN`;`main` 里 `gofakes3.New(s3gw.New(svc,st), WithAutoBucket(true))`,再用 `s3Backend.ImageProcessHandler(faker.Server())` 套图片中间件。
+- 映射:S3 桶+键 → `store` 的 `s3_buckets`(桶注册表)+ `s3_keys`(`bucket/key`→root 索引);对象字节走 `object.Service.Put/Open`。
+- **ETag=内容 MD5**:PUT 时 gofakes3 自己用 hashingReader 算(我们不算);GET/HEAD 时我们必须回 `Object.Hash`=`meta.MD5`(故 `Service.Put` 在摄取同一遍里多算一个 MD5 存进 `ObjectMeta.MD5`)。
+- `WithAutoBucket(true)`:对不存在的桶 PUT 会自动建桶,兼容「app 假定桶已存在/不显式建桶」。
+- **不实现 `MultipartBackend`**:gofakes3 用内存 fallback 攒齐分片再调一次 `PutObject` → 仅适合小文件(大文件 = 第二阶段,见 §10)。
+- **不验签名**:gofakes3 不校验 SigV2/V4。写安全靠网络隔离,只能绑内网接口。
+
+## 5. 并发模型
+
+- N 个 HTTP 请求 goroutine + **1 个** worker goroutine。
+- 所有元数据/队列变更都走 bbolt 事务,**单写者串行化**,无需额外锁。读用 `View`,写用 `Update`。
+- 缓存文件用内容寻址路径 + 原子 `rename`;冷读临时文件名带随机后缀避免并发撞名。
+- 改动涉及并发路径时**必须** `go test -race`。
+
+## 6. 配置(全部 env,见 `.env.example`)
+
+必填:`ZGS_NODES`(逗号分隔存储节点 RPC)、`ZGS_ETH_RPC`(宿主链 RPC)、`ZGS_PRIVATE_KEY`(出证私钥,hex 无 0x)。
+常用可选:`ZGS_GW_LISTEN`(:8080,即对外 S3 端点;不验签名,只能绑内网)、`ZGS_GW_DATA_DIR`(./data)、`ZGS_GW_MAX_SIZE`(默认 4GiB)、`ZGS_GW_BATCH_MAX`(20)、`ZGS_GW_FLUSH_INTERVAL_MS`(3000,必须>0)、`ZGS_GW_MAX_RETRIES`(5)、`ZGS_EXPECTED_REPLICA`(默认=节点数)。
+
+## 7. 构建 / 测试 / 运行
+
+```
+make build   # → bin/gateway
+make test    # go test ./...
+make lint    # gofmt -l . && go vet ./...
+make e2e     # ZGS_E2E=1 真网端到端，需 ZGS_PRIVATE_KEY
+```
+单测用 fake(`fakeDL` / `fakeChain`)隔离 0G,毫秒级。**提交前**至少 `go test -race ./...` + `gofmt -l`(应为空)+ `go vet`。
+
+## 8. 编码约定(改代码时遵守)
+
+- 风格贴合现有代码:注释解释「**为什么**」(不变量、崩溃语义、SDK 行为),而非复述代码。
+- 每个状态转换 = 一个 bbolt 事务;新增队列/状态语义时同步改 `requeue`。
+- 错误用 `fmt.Errorf("...: %w", err)` 包装;sentinel error 用 `errors.Is` 判断。
+- 不要用 SDK 的 `Must*` 构造器(会 `os.Exit` 绕过错误返回);用返回 error 的版本,见 `chain.New`。
+- 加了 `ObjectMeta` 字段记得它是 JSON、需向后兼容。
+- 动了 `service`/`worker`/`store` 必加/改对应 `_test.go`,并跑 `-race`。
+
+## 9. 维护者必读的坑
+
+1. **内容去重 ⇒ root 多对一**:内容相同 → 同一个 root。多个 S3 桶/键可指向同一 root;**按桶/键删除安全**(`S3DeleteObjectKey` 只删 `bucket/key→root` 映射,不碰对象本身,也不影响共享同 root 的其它键)。无「root 级删除」对外接口。
+2. **逻辑删除,数据不可物理擦除**:0G 内容寻址、不可变。底层仍有 `MarkDeleted`/`Undelete`/`Deleted` 标志机制,`Undelete` 在「同内容删后重传」时被 `object.Service.Put` 触发以复活对象;但 S3 删除走纯索引删除(`S3DeleteObjectKey`),**不**置 `Deleted` 标志,故该机制目前外部无触达路径(保留为内部不变量)。
+3. **`requeue` 是队列一致性的唯一出口**:它对 `Deleted` 返回前先把 root 从两条队列删掉,且 Deleted 不再入队。绕过它直接写队列会破坏不变量。
+4. **SkipTx 的 txHash**:一批全是 SkipTx 时 SDK 不发新 tx、返回零 hash;`BatchUpload` 此时返回空串,worker 对 SkipTx 项也传空 txHash,**避免用零 hash 覆盖真实 hash**。
+5. **`FileStatus` 是 any-node 语义**:任一节点报 finalized 即 finalized。曾改成 quorum(需 `ExpectedReplica` 个节点),但因 demo 下单节点滞后会卡死最终化而**回退**。若要改回 quorum,注意默认 `replica=节点数` 会让一个挂掉的节点永久阻塞。
+6. **缓存校验只比大小**:热读只校验文件大小(4GB 对象每次重算 hash 不现实);等长位翻转查不出。冷读从 0G 下载是带 merkle proof 的,完整校验在那一层。
+7. **上传是异步的**:`Put` 返回即 `pending` 且可读(本地缓存);真正上链由 worker 异步完成。别假设返回后已 finalized。
+
+## 10. 已知限制 / 待办(均为有意为之,非 bug)
+
+- **唯一对外接口是 S3(`internal/s3gw` + gofakes3)= demo 级**:
+  - **不验签名**:gofakes3 不校验 SigV2/V4。AK/SK 任意非空值即可;写安全靠网络隔离,**只能绑内网接口**。真鉴权(presigned 验签 / AK/SK 最小权限)= 第二阶段(评估迁 versitygw,见提交历史讨论)。
+  - **无 multipart 后端**:gofakes3 用内存 fallback 攒齐分片再调一次 `PutObject` → 仅适合小文件;无分段上传协议,单对象 ≤ `MaxSize`(默认 4GiB)。
+  - 无 versioning;**不支持空对象**(0G 无法寻址 0 字节,返回 InvalidArgument);ListObjects 支持 prefix 但**无分页**。
+  - conditional PUT(If-Match/If-None-Match)**已支持**,但条件检查与 key 写入**非原子**(检查在慢速摄取之前,写入在之后):并发同 key 的条件 PUT 可能都通过。受架构所限(摄取是流式落盘+算 root,无法塞进一个 bbolt 事务),demo 单写者场景接受此非原子性,不加锁。CopyObject 原生**零拷贝**(只改 `bucket/key→root` 映射,不重传)。
+  - **S3 元数据按内容、非按 key**:`s3_keys` 只存 `bucket/key→root`,对象的 ContentType/Filename 取自 `root` 的 `ObjectMeta`(按内容)。故**字节完全相同、但 Content-Type 不同**的两个 key 去重到同一 root 后,GET/HEAD 会返回首个创建者的 Content-Type。demo 影响极小(同字节通常同类型);如需按 key 元数据,需把 key 记录从「裸 root」改成 `{root, contentType, ...}`(store + s3gw 改动,第二阶段)。
+  - **OBS SDK 对接**:配 `signature=v2` + `path_style=true` + `server=http://网关`(整 URL,IP 会自动 path-style + 关签名协商)。已用真实华为 OBS Node.js SDK 跑通(`integration/obssdk_test.go` + `integration/testdata/obs-js/`,npm 装在 testdata 下以免 `go test ./...` 扫到 node_modules):put/get/head/list/range/presigned-GET/delete 全过。
+  - ⚠️ **已知限制:经 OBS SDK 调 CopyObject 会让 gofakes3 panic**(它在 url-decode 前就按 `/` 切 URL 编码的 `X-Amz-Copy-Source`,见 `gofakes3.go:737`)——属 gofakes3 层 bug,我们的 `Backend.CopyObject` 本身正确(Go 测试覆盖)。第二阶段(自控 S3 层 / 迁 versitygw / 给 gofakes3 打补丁)修复。
+- **图片处理 = 仅 `image/resize`**(华为 `?x-image-process=image/resize,w_,h_,m_` 语法,`s3gw.ImageProcessHandler` + `internal/imageproc`),刻意不做华为云完整图片处理;**派生图不缓存**(每次实时算),大图(>20MB)拒绝,非图片对象返回 400,不识别的 spec 透传原图。视频截图(MPC)未做。
+
+## 11. 文档地图
+
+- `README.md` —— 人读的简洁架构 + 数据/控制流。
+- `0g-gateway-design.md` —— 原始设计文档(形态 A:OBS→0G 适配层;SDK 真实接口、机密性、Pruner 风险等深入背景)。
+- `docs/migration-from-obs.md` —— S3 接入对接文档(华为 OBS SDK 连接配置、支持的 S3 操作、图片处理、限制)。
+- `docs/接口说明.md` —— 给不懂 0G 的对接方的一页纸 S3 能力/差异说明。
+- `.env.example` —— 配置项清单。

@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"strings"
 
 	"github.com/0gfoundation/0g-storage-client/common/blockchain"
@@ -15,6 +14,7 @@ import (
 	"github.com/0gfoundation/0g-storage-client/node"
 	"github.com/0gfoundation/0g-storage-client/transfer"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/openweb3/web3go"
 
 	"zgs-gateway/internal/uploader"
@@ -44,17 +44,42 @@ func New(ctx context.Context, opt Options) (*Backend, error) {
 		opt.ExpectedReplica = 1
 	}
 
-	w3 := blockchain.MustNewWeb3(opt.EthRPC, opt.PrivateKey)
+	// Validate the key up front: the SDK's web3/signer constructors fatally
+	// exit (logrus.Fatal → os.Exit) on a malformed key, which would bypass
+	// this function's error return and the caller's deferred cleanup.
+	if _, err := crypto.HexToECDSA(strings.TrimPrefix(opt.PrivateKey, "0x")); err != nil {
+		return nil, fmt.Errorf("invalid private key: %w", err)
+	}
+
+	w3, err := blockchain.NewWeb3(opt.EthRPC, opt.PrivateKey)
+	if err != nil {
+		return nil, fmt.Errorf("connect eth rpc: %w", err)
+	}
 	up, closer, err := transfer.NewUploaderFromConfig(ctx, w3, transfer.UploaderConfig{Nodes: opt.Nodes})
 	if err != nil {
 		w3.Close()
 		return nil, fmt.Errorf("create uploader: %w", err)
 	}
-	clients := node.MustNewZgsClients(opt.Nodes, nil)
+	clients := make([]*node.ZgsClient, 0, len(opt.Nodes))
+	for _, url := range opt.Nodes {
+		c, err := node.NewZgsClient(url, nil)
+		if err != nil {
+			closer()
+			w3.Close()
+			for _, cc := range clients {
+				cc.Close()
+			}
+			return nil, fmt.Errorf("connect storage node %s: %w", url, err)
+		}
+		clients = append(clients, c)
+	}
 	dl, err := transfer.NewDownloader(clients)
 	if err != nil {
 		closer()
 		w3.Close()
+		for _, c := range clients {
+			c.Close()
+		}
 		return nil, fmt.Errorf("create downloader: %w", err)
 	}
 	return &Backend{w3: w3, up: up, upCloser: closer, clients: clients, dl: dl, replica: opt.ExpectedReplica}, nil
@@ -100,16 +125,31 @@ func (b *Backend) BatchUpload(ctx context.Context, items []uploader.Item) (strin
 	if err != nil {
 		return "", err
 	}
+	// A root mismatch means the bytes 0G stored are not the bytes the gateway
+	// addressed: fail the batch rather than recording the gateway root as
+	// onchain. The worker reconciles and retries from this error.
+	if len(roots) != len(items) {
+		return "", fmt.Errorf("0g returned %d roots for %d uploaded items", len(roots), len(items))
+	}
 	for i, r := range roots {
 		if !strings.EqualFold(r.Hex(), items[i].Root) {
-			slog.Error("uploaded root does not match gateway-computed root",
-				"index", i, "gateway", items[i].Root, "sdk", r.Hex())
+			return "", fmt.Errorf("root mismatch at index %d: gateway computed %s, 0g returned %s",
+				i, items[i].Root, r.Hex())
 		}
+	}
+	if (txHash == common.Hash{}) {
+		// All items were SkipTx (segments-only re-upload); no new transaction
+		// was submitted. Return an empty hash so the worker keeps each object's
+		// existing txHash instead of overwriting it with the zero hash.
+		return "", nil
 	}
 	return txHash.Hex(), nil
 }
 
-// FileStatus aggregates zgs_getFileInfo across all configured nodes.
+// FileStatus aggregates zgs_getFileInfo across all configured nodes. A single
+// node reporting finalized is treated as finalized: this reaches the finalized
+// state fastest and never wedges when a node lags, which matters more here than
+// confirming durable replication across every node.
 func (b *Backend) FileStatus(ctx context.Context, rootHex string) (uploader.FileStatus, error) {
 	root := common.HexToHash(rootHex)
 	var sawUploading, sawPruned bool

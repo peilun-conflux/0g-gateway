@@ -106,6 +106,49 @@ func TestFlushHappyPath(t *testing.T) {
 	}
 }
 
+func TestSkipTxKeepsExistingTxHash(t *testing.T) {
+	ch := newFakeChain()
+	w, st := setup(t, ch, Config{BatchMax: 10, MaxRetries: 3})
+	roots := addPending(t, st, 1)
+	// the object is already on chain under its original tx, left in "submitted"
+	// by a crash; reconcile will mark it SkipTx (segments-only)
+	if err := st.SetStatus(roots[0], store.StatusSubmitted, "0xORIGINAL", ""); err != nil {
+		t.Fatal(err)
+	}
+	ch.status[roots[0]] = FileUploading
+	ch.txHash = "0xNEWBATCH"
+
+	if err := w.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m, _, _ := st.Get(roots[0])
+	if m.Status != store.StatusOnchain {
+		t.Fatalf("status after flush: %+v", m)
+	}
+	if m.TxHash != "0xORIGINAL" {
+		t.Fatalf("SkipTx item lost its original txHash: got %q want 0xORIGINAL", m.TxHash)
+	}
+}
+
+func TestFlushDoesNotUploadDeleted(t *testing.T) {
+	ch := newFakeChain()
+	w, st := setup(t, ch, Config{BatchMax: 10, MaxRetries: 3})
+	roots := addPending(t, st, 2)
+	if err := st.MarkDeleted(roots[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(ch.batches) != 1 || len(ch.batches[0]) != 1 {
+		t.Fatalf("deleted object uploaded: %+v", ch.batches)
+	}
+	if ch.batches[0][0].Root != roots[1] {
+		t.Fatalf("wrong object uploaded: %+v", ch.batches[0])
+	}
+}
+
 func TestFlushRespectsBatchMax(t *testing.T) {
 	ch := newFakeChain()
 	w, st := setup(t, ch, Config{BatchMax: 2, MaxRetries: 3})

@@ -30,7 +30,6 @@ var (
 	ErrEmpty    = errors.New("empty object rejected (0G cannot address zero-byte files)")
 	ErrTooLarge = errors.New("object exceeds the configured size limit")
 	ErrNotFound = errors.New("object not found")
-	ErrGone     = errors.New("object deleted")
 )
 
 // Downloader restores an object from 0G into a local file (cold read path).
@@ -134,7 +133,7 @@ func (s *Service) Put(ctx context.Context, r io.Reader, filename, contentType st
 	if m, ok, err := s.st.BySHA256(shaHex); err != nil {
 		cleanup()
 		return store.ObjectMeta{}, false, err
-	} else if ok && !m.Deleted {
+	} else if ok {
 		// Until an object is finalized on 0G, the local cache file is its only
 		// copy. If a non-finalized object's cache file went missing, salvage it
 		// from the bytes we just spooled (same content ⇒ same root) instead of
@@ -196,22 +195,8 @@ func (s *Service) Put(ctx context.Context, r io.Reader, filename, contentType st
 	}
 	if err := s.st.CreateObject(m); err != nil {
 		if errors.Is(err, store.ErrExists) {
-			ex, _, gerr := s.st.Get(root)
-			if gerr != nil {
-				return store.ObjectMeta{}, false, gerr
-			}
-			if ex.Deleted {
-				// identical content re-uploaded after a logical delete. The
-				// fresh cache file is already in place (renamed above), so
-				// resurrect the object and re-arm its upload rather than
-				// handing back a root that still serves 410 Gone.
-				if err := s.st.Undelete(root); err != nil {
-					return store.ObjectMeta{}, false, err
-				}
-				ex, _, gerr = s.st.Get(root)
-				return ex, false, gerr
-			}
 			// lost a race with an identical concurrent PUT — that's a dedup hit
+			ex, _, gerr := s.st.Get(root)
 			return ex, true, gerr
 		}
 		return store.ObjectMeta{}, false, err
@@ -229,9 +214,6 @@ func (s *Service) Open(ctx context.Context, root string) (*os.File, store.Object
 	}
 	if !ok {
 		return nil, store.ObjectMeta{}, ErrNotFound
-	}
-	if m.Deleted {
-		return nil, m, ErrGone
 	}
 
 	p := s.CachePath(root)

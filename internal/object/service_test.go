@@ -211,43 +211,6 @@ func TestOpenColdDownloadsFrom0G(t *testing.T) {
 	}
 }
 
-func TestPutResurrectsDeletedContent(t *testing.T) {
-	content := randBytes(t, 300)
-	svc, st := newSvc(t, &fakeDL{}, 0)
-
-	m1, _, err := svc.Put(context.Background(), bytes.NewReader(content), "a", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.MarkDeleted(m1.Root); err != nil {
-		t.Fatal(err)
-	}
-
-	// re-uploading identical content must bring the object back, not hand back
-	// a deleted record that still serves 410 Gone
-	m2, dedup, err := svc.Put(context.Background(), bytes.NewReader(content), "a-again", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if m2.Root != m1.Root {
-		t.Fatalf("resurrect root differs: %s vs %s", m2.Root, m1.Root)
-	}
-	if dedup {
-		t.Fatal("resurrect reported as a dedup hit")
-	}
-	if got, _, _ := st.Get(m1.Root); got.Deleted {
-		t.Fatalf("still deleted after re-upload: %+v", got)
-	}
-	f, _, err := svc.Open(context.Background(), m1.Root)
-	if err != nil {
-		t.Fatalf("open after resurrect: %v", err)
-	}
-	f.Close()
-	if q, _ := st.UploadQueue(10); len(q) != 1 {
-		t.Fatalf("resurrected object not enqueued for upload: %d", len(q))
-	}
-}
-
 func TestPutSalvagesMissingCacheOnDedup(t *testing.T) {
 	content := randBytes(t, 400)
 	svc, st := newSvc(t, &fakeDL{}, 0)
@@ -329,21 +292,9 @@ func TestOpenCorruptCacheNotOn0GFailsClosed(t *testing.T) {
 	}
 }
 
-func TestOpenUnknownAndDeleted(t *testing.T) {
-	svc, st := newSvc(t, &fakeDL{}, 0)
+func TestOpenUnknown(t *testing.T) {
+	svc, _ := newSvc(t, &fakeDL{}, 0)
 	if _, _, err := svc.Open(context.Background(), "0xnope"); err != ErrNotFound {
 		t.Fatalf("want ErrNotFound, got %v", err)
-	}
-
-	content := randBytes(t, 64)
-	m, _, err := svc.Put(context.Background(), bytes.NewReader(content), "a", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.MarkDeleted(m.Root); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := svc.Open(context.Background(), m.Root); err != ErrGone {
-		t.Fatalf("want ErrGone, got %v", err)
 	}
 }

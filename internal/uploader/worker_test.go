@@ -130,25 +130,6 @@ func TestSkipTxKeepsExistingTxHash(t *testing.T) {
 	}
 }
 
-func TestFlushDoesNotUploadDeleted(t *testing.T) {
-	ch := newFakeChain()
-	w, st := setup(t, ch, Config{BatchMax: 10, MaxRetries: 3})
-	roots := addPending(t, st, 2)
-	if err := st.MarkDeleted(roots[0]); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := w.Flush(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if len(ch.batches) != 1 || len(ch.batches[0]) != 1 {
-		t.Fatalf("deleted object uploaded: %+v", ch.batches)
-	}
-	if ch.batches[0][0].Root != roots[1] {
-		t.Fatalf("wrong object uploaded: %+v", ch.batches[0])
-	}
-}
-
 func TestFlushRespectsBatchMax(t *testing.T) {
 	ch := newFakeChain()
 	w, st := setup(t, ch, Config{BatchMax: 2, MaxRetries: 3})

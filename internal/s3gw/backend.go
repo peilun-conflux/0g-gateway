@@ -139,7 +139,7 @@ func (b *Backend) conditionalInfo(bucket, key string) (*gofakes3.ConditionalObje
 	if err != nil {
 		return nil, err
 	}
-	if !ok || m.Deleted {
+	if !ok {
 		return &gofakes3.ConditionalObjectInfo{Exists: false}, nil
 	}
 	return &gofakes3.ConditionalObjectInfo{Exists: true, Hash: hexBytes(m.MD5)}, nil
@@ -153,7 +153,7 @@ func (b *Backend) GetObject(bucketName, objectName string, rangeRequest *gofakes
 
 	f, m, err := b.svc.Open(context.Background(), root)
 	if err != nil {
-		if errors.Is(err, object.ErrNotFound) || errors.Is(err, object.ErrGone) {
+		if errors.Is(err, object.ErrNotFound) {
 			return nil, gofakes3.KeyNotFound(objectName)
 		}
 		return nil, err
@@ -193,7 +193,7 @@ func (b *Backend) HeadObject(bucketName, objectName string) (*gofakes3.Object, e
 	if err != nil {
 		return nil, err
 	}
-	if !ok || m.Deleted {
+	if !ok {
 		return nil, gofakes3.KeyNotFound(objectName)
 	}
 	return &gofakes3.Object{
@@ -246,7 +246,7 @@ func (b *Backend) CopyObject(srcBucket, srcKey, dstBucket, dstKey string, meta m
 	if err != nil {
 		return res, err
 	}
-	if !ok || m.Deleted {
+	if !ok {
 		return res, gofakes3.KeyNotFound(srcKey)
 	}
 	if err := b.st.S3PutObjectKey(dstBucket, dstKey, root); err != nil {

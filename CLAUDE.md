@@ -40,7 +40,7 @@ root(`0x…`,服务端生成,天然去重 + 可校验)。桶/键 → root 的映
 - `s3_buckets`:`桶名 → BucketRecord(JSON)` —— S3 桶注册表
 - `s3_keys`:`"bucket/key" → root` —— S3 对象索引(纯索引,不碰对象/队列)
 
-`ObjectMeta` 关键字段:`Root, SHA256, Size, Filename, ContentType, Status, TxHash, FailReason, Retries, SkipTx, Deleted, CreatedAt, UpdatedAt`。存 JSON,加字段向后兼容。
+`ObjectMeta` 关键字段:`Root, SHA256, MD5, Size, Filename, ContentType, Status, TxHash, FailReason, Retries, SkipTx, CreatedAt, UpdatedAt`。存 JSON,加字段向后兼容。
 
 **状态机**(`store.Status`):
 ```
@@ -49,22 +49,21 @@ pending ──► submitted ──► onchain ──► finalized
   待上传）    待回执）      待最终性）       终态·成功）
    └────────────────────────────────► failed（重试耗尽 / 被 prune，终态）
 ```
-正交标志:`Deleted`(逻辑删除)、`SkipTx`(对账判定 entry 已在链上,只补传分片)。
+正交标志:`SkipTx`(对账判定 entry 已在链上,只补传分片)。无「逻辑删除」标志——对象一旦摄取即不可删(删除只发生在 S3 索引层,见 §4.4 / §9)。
 
-队列成员关系由 `store.requeue` 统一维护:**Deleted 的对象永不入队**(见 §9)。`mutate`/`CreateObject` 每次落库都调 `requeue` 保持队列与 status 一致。
+队列成员关系由 `store.requeue` 统一维护:清空两条队列后按 status 重新入队。`mutate`/`CreateObject` 每次落库都调 `requeue` 保持队列与 status 一致。
 
 ## 4. 控制流
 
 ### 4.1 摄取 `PUT`(`object.Service.Put`)
-1. 流式写 spool 临时文件,同时算 SHA256(可选 `MaxSize` 用 `LimitReader` 限流)。
+1. 流式写 spool 临时文件,同时算 SHA256 + MD5(可选 `MaxSize` 用 `LimitReader` 限流)。
 2. 空对象拒绝(`ErrEmpty`);超限拒绝(`ErrTooLarge`)。
-3. **按明文 SHA 去重**:命中且未删除 → 直接返回(dedup)。其中:
+3. **按明文 SHA 去重**:命中 → 直接返回(dedup)。其中:
    - 命中对象非 finalized 但**缓存文件丢失** → 用刚写的 spool 救回缓存并重新入队(salvage)。
    - 命中对象是 `failed` → `Reenqueue` 重试。
 4. 未命中:`fsync` spool → 算 merkle root(`core.MerkleRoot`)→ `rename` 进缓存 `objects/{root}`。
 5. `CreateObject` 写元数据 + SHA 索引 + 入 `q_upload`。
-   - 若 `ErrExists` 且该 root **已被逻辑删除** → `Undelete` 复活(同内容重传即恢复),返回非 dedup。
-   - 若 `ErrExists` 未删除 → 与并发相同 PUT 抢输了,当 dedup 命中。
+   - 若 `ErrExists`(与并发相同 PUT 抢输了)→ 当 dedup 命中返回。
 
 **崩溃一致性**:缓存文件先 fsync+rename 落地,**再**提交元数据/任务记录。中途崩溃只会留下孤儿缓存文件(无害),不会出现「有任务无数据」。
 
@@ -79,7 +78,7 @@ pending ──► submitted ──► onchain ──► finalized
 `PollFinality`:扫 `q_finalize` → `FileStatus`:finalized→`finalized`;pruned→`failed`(告警条件)。
 
 ### 4.3 下载 `GET`(`object.Service.Open`)
-1. 元数据不存在→`ErrNotFound`;`Deleted`→`ErrGone`。
+1. 元数据不存在→`ErrNotFound`。
 2. **热路径**:缓存文件存在且**大小等于** `meta.Size` → 直接返回(`http.ServeContent` 处理 Range/HEAD/If-Modified-Since)。大小不符视为损坏,丢弃走冷路径。
 3. **冷路径**:从 0G `Download`(**带 merkle proof 校验**)到唯一临时路径 → `rename` 进缓存 → 返回。
    - 缓存损坏但对象不在 0G(如 pending)→ 冷读失败 → `502`(失败关闭,不返回错误字节)。
@@ -127,13 +126,12 @@ make e2e     # ZGS_E2E=1 真网端到端，需 ZGS_PRIVATE_KEY
 
 ## 9. 维护者必读的坑
 
-1. **内容去重 ⇒ root 多对一**:内容相同 → 同一个 root。多个 S3 桶/键可指向同一 root;**按桶/键删除安全**(`S3DeleteObjectKey` 只删 `bucket/key→root` 映射,不碰对象本身,也不影响共享同 root 的其它键)。无「root 级删除」对外接口。
-2. **逻辑删除,数据不可物理擦除**:0G 内容寻址、不可变。底层仍有 `MarkDeleted`/`Undelete`/`Deleted` 标志机制,`Undelete` 在「同内容删后重传」时被 `object.Service.Put` 触发以复活对象;但 S3 删除走纯索引删除(`S3DeleteObjectKey`),**不**置 `Deleted` 标志,故该机制目前外部无触达路径(保留为内部不变量)。
-3. **`requeue` 是队列一致性的唯一出口**:它对 `Deleted` 返回前先把 root 从两条队列删掉,且 Deleted 不再入队。绕过它直接写队列会破坏不变量。
-4. **SkipTx 的 txHash**:一批全是 SkipTx 时 SDK 不发新 tx、返回零 hash;`BatchUpload` 此时返回空串,worker 对 SkipTx 项也传空 txHash,**避免用零 hash 覆盖真实 hash**。
-5. **`FileStatus` 是 any-node 语义**:任一节点报 finalized 即 finalized。曾改成 quorum(需 `ExpectedReplica` 个节点),但因 demo 下单节点滞后会卡死最终化而**回退**。若要改回 quorum,注意默认 `replica=节点数` 会让一个挂掉的节点永久阻塞。
-6. **缓存校验只比大小**:热读只校验文件大小(4GB 对象每次重算 hash 不现实);等长位翻转查不出。冷读从 0G 下载是带 merkle proof 的,完整校验在那一层。
-7. **上传是异步的**:`Put` 返回即 `pending` 且可读(本地缓存);真正上链由 worker 异步完成。别假设返回后已 finalized。
+1. **内容去重 ⇒ root 多对一**:内容相同 → 同一个 root。多个 S3 桶/键可指向同一 root;**删除只发生在 S3 索引层**(`S3DeleteObjectKey` 只删 `bucket/key→root` 映射,不碰对象本身,也不影响共享同 root 的其它键)。对象一旦摄取,其元数据/缓存/上链永不删除——0G 内容寻址、不可变,数据**不可物理擦除**;有合规擦除需求需单独设计。无「root 级删除」、无「逻辑删除」标志。
+2. **`requeue` 是队列一致性的唯一出口**:清空两条队列后按 status 重新入队。绕过它直接写队列会破坏不变量。
+3. **SkipTx 的 txHash**:一批全是 SkipTx 时 SDK 不发新 tx、返回零 hash;`BatchUpload` 此时返回空串,worker 对 SkipTx 项也传空 txHash,**避免用零 hash 覆盖真实 hash**。
+4. **`FileStatus` 是 any-node 语义**:任一节点报 finalized 即 finalized。曾改成 quorum(需 `ExpectedReplica` 个节点),但因 demo 下单节点滞后会卡死最终化而**回退**。若要改回 quorum,注意默认 `replica=节点数` 会让一个挂掉的节点永久阻塞。
+5. **缓存校验只比大小**:热读只校验文件大小(4GB 对象每次重算 hash 不现实);等长位翻转查不出。冷读从 0G 下载是带 merkle proof 的,完整校验在那一层。
+6. **上传是异步的**:`Put` 返回即 `pending` 且可读(本地缓存);真正上链由 worker 异步完成。别假设返回后已 finalized。
 
 ## 10. 已知限制 / 待办(均为有意为之,非 bug)
 

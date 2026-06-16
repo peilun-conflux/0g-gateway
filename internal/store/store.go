@@ -57,7 +57,6 @@ type ObjectMeta struct {
 	FailReason  string    `json:"failReason,omitempty"`
 	Retries     int       `json:"retries"`
 	SkipTx      bool      `json:"skipTx,omitempty"` // reconcile decided the entry is already on chain
-	Deleted     bool      `json:"deleted,omitempty"`
 	CreatedAt   time.Time `json:"createdAt"`
 	UpdatedAt   time.Time `json:"updatedAt"`
 }
@@ -118,9 +117,8 @@ func getMeta(tx *bolt.Tx, root string) (ObjectMeta, bool, error) {
 	return m, true, nil
 }
 
-// requeue keeps an object's queue membership in sync with its current state.
-// A deleted object is never (re)enqueued: it must not be uploaded to immutable
-// 0G storage nor polled for finality.
+// requeue keeps an object's queue membership in sync with its current status:
+// it clears both queues, then re-enqueues into the one matching the status.
 func requeue(tx *bolt.Tx, m ObjectMeta) error {
 	key := []byte(m.Root)
 	if err := tx.Bucket(bucketUpload).Delete(key); err != nil {
@@ -128,9 +126,6 @@ func requeue(tx *bolt.Tx, m ObjectMeta) error {
 	}
 	if err := tx.Bucket(bucketFinalize).Delete(key); err != nil {
 		return err
-	}
-	if m.Deleted {
-		return nil
 	}
 	switch m.Status {
 	case StatusPending, StatusSubmitted:
@@ -242,27 +237,6 @@ func (s *Store) IncRetries(root string) (int, error) {
 
 func (s *Store) SetSkipTx(root string, v bool) error {
 	_, err := s.mutate(root, func(m *ObjectMeta) { m.SkipTx = v })
-	return err
-}
-
-func (s *Store) MarkDeleted(root string) error {
-	_, err := s.mutate(root, func(m *ObjectMeta) { m.Deleted = true })
-	return err
-}
-
-// Undelete clears the logical-delete flag. Unless the object is already
-// finalized on 0G (in which case the data is still retrievable as-is), it is
-// reset to pending so the cache file is re-uploaded — covering the case where
-// identical content is re-submitted after a delete.
-func (s *Store) Undelete(root string) error {
-	_, err := s.mutate(root, func(m *ObjectMeta) {
-		m.Deleted = false
-		if m.Status != StatusFinalized {
-			m.Status = StatusPending
-			m.Retries = 0
-			m.FailReason = ""
-		}
-	})
 	return err
 }
 
@@ -382,10 +356,9 @@ func (s *Store) S3DeleteObjectKey(bucket, key string) error {
 	})
 }
 
-// S3ListObjects returns every live object in the bucket as (key, metadata),
+// S3ListObjects returns every object in the bucket as (key, metadata),
 // resolving each root within the SAME read transaction to avoid N+1 lookups.
-// Deleted objects are skipped; prefix matching for the S3 list request is
-// applied by the caller.
+// Prefix matching for the S3 list request is applied by the caller.
 func (s *Store) S3ListObjects(bucket string) ([]S3Object, error) {
 	var out []S3Object
 	pfx := s3Prefix(bucket)
@@ -396,7 +369,7 @@ func (s *Store) S3ListObjects(bucket string) ([]S3Object, error) {
 			if err != nil {
 				return err
 			}
-			if !ok || m.Deleted {
+			if !ok {
 				continue
 			}
 			out = append(out, S3Object{Key: string(k[len(pfx):]), Meta: m})

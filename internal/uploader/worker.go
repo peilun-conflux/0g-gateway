@@ -85,14 +85,14 @@ func (w *Worker) processBatch(ctx context.Context, batch []store.ObjectMeta) err
 	// nodes before re-submitting; fresh pending items skip the extra RPC.
 	items := make([]Item, 0, len(batch))
 	for _, m := range batch {
-		// The queue was snapshotted up front, so re-read each object: a delete
-		// (or other state change) may have landed since. A logically deleted
-		// object must never be uploaded — 0G storage is immutable.
+		// The queue was snapshotted up front, so re-read each object to pick up
+		// any state change a concurrent PUT landed since (e.g. a salvage that
+		// reset the object to pending and rearmed its upload).
 		cur, ok, err := w.st.Get(m.Root)
 		if err != nil {
 			return err
 		}
-		if !ok || cur.Deleted {
+		if !ok {
 			continue
 		}
 		m = cur

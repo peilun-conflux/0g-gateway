@@ -1,7 +1,7 @@
 'use strict';
 // Validates the gateway's S3-compatible endpoint (gofakes3 + s3gw) against the
 // real Huawei OBS Node.js SDK (esdk-obs-nodejs). The Go harness in
-// integration/obs_js_test.go starts the server and runs this script.
+// integration/obssdk_test.go starts the server and runs this script.
 //
 // Config mirrors the demo guidance: signature=v2 + path_style. Passing a full
 // http:// URL as `server` makes the SDK use http and (for an IP host) path-

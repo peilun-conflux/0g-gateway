@@ -17,9 +17,9 @@
 | | 状态 |
 |---|---|
 | 实测 SDK | 华为 OBS Node.js SDK **`esdk-obs-nodejs ^3.26.2`**(`integration/testdata/obs-js/`) |
-| 实测覆盖 | 建桶 / 上传 / 下载 / Range / HEAD / 列举 / 预签名 GET / 删除 —— **全部通过** |
+| 实测覆盖 | 建桶 / 上传 / 下载 / Range / HEAD / 列举 / 复制 / 预签名 GET / 删除 —— **全部通过** |
 | 必须配置 | `signature: 'v2'` + `path_style: true` + `server` 传完整 URL |
-| 不支持 | **copyObject(经 OBS SDK 会 panic,见 §5.1)**、Multipart 分段上传、空对象、List 分页、Versioning |
+| 不支持 | Multipart 分段上传、空对象、List 分页、Versioning |
 | 安全 | **不验签名**(demo),只绑内网;预签名 URL 能取到对象但**不被强制**(非访问控制) |
 
 ---
@@ -64,6 +64,7 @@ const client = new ObsClient({
 | `getObjectMetadata` | 取对象头(HEAD):大小、Content-Type、ETag,不触发从 0G 回源 |
 | `listObjects` | 列举对象,**支持 `Prefix` 前缀过滤**;**不支持分页**(见 §5.5) |
 | `deleteObject` | 删除对象(删除后该键 GET 返回 404) |
+| `copyObject` | 服务端复制;**零拷贝**(内容寻址,同字节不重传)。中间件规范化 `X-Amz-Copy-Source` 后经 OBS SDK 正常工作(见 §5.1) |
 | `createSignedUrlSync`(Method=GET) | 生成预签名下载 URL;能正常取回对象。⚠️ **但不被强制**,见 §5.3 |
 
 > **ETag = 对象内容的 MD5**(PUT 时由网关在摄取时计算)。
@@ -116,14 +117,13 @@ curl "http://<gw>:8080/demo/user/123/avatar.png?x-image-process=image/resize,w_2
 
 ## 5. 注意事项(对接前务必阅读)
 
-### 5.1 ⚠️ 不要经 OBS SDK 调用 `copyObject`(会触发服务端 panic)
+### 5.1 copyObject 已支持(早期限制已修复)
 
-经华为 OBS SDK 调 `copyObject` 会让底层 S3 兼容库(gofakes3)**崩溃**——它在 url-decode **之前**就按 `/`
-切分 URL 编码的 `X-Amz-Copy-Source` 头(gofakes3 层 bug)。
+如果你看过早期说明称「copyObject 经 OBS SDK 会崩」——**已修复,现在可正常使用。**
 
-- **网关自身的 CopyObject 逻辑是正确的**(零拷贝:内容寻址,同字节不重传;有 Go 测试覆盖)。
-- 但**经 OBS SDK 触发**会命中上述库 bug。**当前请勿经 OBS SDK 使用对象复制**。
-- 修复留待第二阶段(自控 S3 层 / 迁移 / 给 gofakes3 打补丁)。
+根因:底层库 gofakes3 在 url-decode **之前**就按 `/` 切分 `X-Amz-Copy-Source` 头,而 OBS SDK 把该头
+整体百分号编码(连 `/` 也编码),导致切分越界 panic。网关在 gofakes3 前加了一个中间件,先把该头
+规范化成 gofakes3 认的形式再放行。已用真实 OBS SDK 实测(复制 → 读回 → 删源后副本仍在)通过。
 
 ### 5.2 不验证签名(写安全靠内网隔离)
 
@@ -194,7 +194,7 @@ go test ./integration/ -run TestOBSJavaScriptSDK -v
 
 1. **改连接配置**:endpoint 指向网关,`signature='v2'` + `path_style=true`,AK/SK 任意非空。
 2. **上传 / 下载 / 删除 / 列举**:沿用原 `putObject / getObject / deleteObject / listObjects(prefix)`,桶名和对象键不变。
-3. **避开 `copyObject`**(§5.1)。
+3. **`copyObject` 可正常使用**(早期限制已修复,§5.1)。
 4. **多租户 / 分区**:用桶 + key 前缀区分(如桶 `tenantA`,键 `avatars/123.png`)。
 
 **存量数据迁移**

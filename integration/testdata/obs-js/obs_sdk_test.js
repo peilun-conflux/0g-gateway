@@ -51,10 +51,14 @@ function bodyText(r) {
   const keys = (list.InterfaceResult.Contents || []).map((c) => c.Key);
   assert.ok(keys.includes(key), `listObjects missing key; got ${JSON.stringify(keys)}`);
 
-  // NOTE: copyObject via the OBS SDK is intentionally not exercised here.
-  // gofakes3 panics parsing the SDK's URL-encoded X-Amz-Copy-Source
-  // (splits on "/" before decoding). Our Backend.CopyObject itself is correct
-  // (covered by the Go test); this is a gofakes3-layer limitation. See CLAUDE.md.
+  // copyObject (server-side copy; zero-copy under content addressing). The OBS
+  // SDK percent-encodes X-Amz-Copy-Source including the "/" separators, which
+  // raw gofakes3 panics on; the gateway's FixCopySourceHandler middleware
+  // normalizes the header so this works end-to-end.
+  const copyKey = 'docs/hello-copy.txt';
+  ok(await client.copyObject({ Bucket: bucket, Key: copyKey, CopySource: `${bucket}/${key}` }), 'copyObject');
+  const copied = ok(await client.getObject({ Bucket: bucket, Key: copyKey }), 'getObject(copy)');
+  assert.strictEqual(bodyText(copied), body, 'copied object body mismatch');
 
   // Range request
   const ranged = ok(await client.getObject({ Bucket: bucket, Key: key, Range: 'bytes=0-4' }), 'getObject(range)');
@@ -82,6 +86,10 @@ function bodyText(r) {
   ok(await client.deleteObject({ Bucket: bucket, Key: key }), 'deleteObject');
   const after = await client.getObject({ Bucket: bucket, Key: key });
   assert.strictEqual(after.CommonMsg.Status, 404, `expected 404 after delete, got ${after.CommonMsg.Status}`);
+
+  // the copy is an independent key, so deleting the source leaves it intact
+  const copyAfter = ok(await client.getObject({ Bucket: bucket, Key: copyKey }), 'getObject(copy after source delete)');
+  assert.strictEqual(bodyText(copyAfter), body, 'copy lost after source delete');
 
   console.log('OBS JS SDK compatibility: PASS');
   process.exit(0);

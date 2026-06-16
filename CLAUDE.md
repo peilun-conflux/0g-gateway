@@ -20,7 +20,7 @@ root(`0x…`,服务端生成,天然去重 + 可校验)。桶/键 → root 的映
 | 包 | 文件 | 职责 |
 |---|---|---|
 | `cmd/gateway` | `main.go` | 进程入口:读 env 配置、装配各组件、起 S3 server 与后台 worker、优雅退出 |
-| `internal/s3gw` | `backend.go`、`imageprocess.go` | **唯一对外接口**:实现 `gofakes3.Backend`,把 S3 桶+键操作映射到 `object.Service`+`store`;`imageprocess.go` 是华为风格 `?x-image-process=image/resize,...` 中间件 |
+| `internal/s3gw` | `backend.go`、`imageprocess.go`、`copysource.go` | **唯一对外接口**:实现 `gofakes3.Backend`,把 S3 桶+键操作映射到 `object.Service`+`store`;`Wrap` 在 gofakes3 前套两个中间件——`copysource.go`(规范化 `X-Amz-Copy-Source`)+ `imageprocess.go`(华为 `?x-image-process=image/resize,...`)|
 | `internal/object` | `service.go` | 摄取/读取管线:spool→sha256(+md5)→去重→merkle root→落缓存→写元数据;冷读回源 |
 | `internal/store` | `store.go` | bbolt 持久化:对象元数据、SHA 索引、两条上传队列、桶注册表 + 桶/键→root 索引;每次状态变更一个事务 |
 | `internal/uploader` | `worker.go` | 后台批量上传 worker:攒批、对账(reconcile)、重试、最终性轮询 |
@@ -86,7 +86,7 @@ pending ──► submitted ──► onchain ──► finalized
 
 ### 4.4 S3 兼容层(`internal/s3gw` + gofakes3,唯一对外接口)
 为让华为 OBS SDK 等 S3 客户端直接接入(OBS≈S3),用 **gofakes3**(嵌入式库,白嫖 S3 协议:XML/Range/aws-chunked 解码/multipart)+ 我们实现的 `gofakes3.Backend`。
-- 即网关主 server,监听 `ZGS_GW_LISTEN`;`main` 里 `gofakes3.New(s3gw.New(svc,st), WithAutoBucket(true))`,再用 `s3Backend.ImageProcessHandler(faker.Server())` 套图片中间件。
+- 即网关主 server,监听 `ZGS_GW_LISTEN`;`main` 里 `gofakes3.New(s3gw.New(svc,st), WithAutoBucket(true))`,再用 `s3Backend.Wrap(faker.Server())` 套上 S3-compat 中间件栈(copy-source 规范化 + 图片处理)。`Wrap` 是 main 与集成测试共用的唯一中间件装配点,避免漂移。
 - 映射:S3 桶+键 → `store` 的 `s3_buckets`(桶注册表)+ `s3_keys`(`bucket/key`→root 索引);对象字节走 `object.Service.Put/Open`。
 - **ETag=内容 MD5**:PUT 时 gofakes3 自己用 hashingReader 算(我们不算);GET/HEAD 时我们必须回 `Object.Hash`=`meta.MD5`(故 `Service.Put` 在摄取同一遍里多算一个 MD5 存进 `ObjectMeta.MD5`)。
 - `WithAutoBucket(true)`:对不存在的桶 PUT 会自动建桶,兼容「app 假定桶已存在/不显式建桶」。
@@ -142,7 +142,7 @@ make e2e     # ZGS_E2E=1 真网端到端，需 ZGS_PRIVATE_KEY
   - conditional PUT(If-Match/If-None-Match)**已支持**,但条件检查与 key 写入**非原子**(检查在慢速摄取之前,写入在之后):并发同 key 的条件 PUT 可能都通过。受架构所限(摄取是流式落盘+算 root,无法塞进一个 bbolt 事务),demo 单写者场景接受此非原子性,不加锁。CopyObject 原生**零拷贝**(只改 `bucket/key→root` 映射,不重传)。
   - **S3 元数据按内容、非按 key**:`s3_keys` 只存 `bucket/key→root`,对象的 ContentType/Filename 取自 `root` 的 `ObjectMeta`(按内容)。故**字节完全相同、但 Content-Type 不同**的两个 key 去重到同一 root 后,GET/HEAD 会返回首个创建者的 Content-Type。demo 影响极小(同字节通常同类型);如需按 key 元数据,需把 key 记录从「裸 root」改成 `{root, contentType, ...}`(store + s3gw 改动,第二阶段)。
   - **OBS SDK 对接**:配 `signature=v2` + `path_style=true` + `server=http://网关`(整 URL,IP 会自动 path-style + 关签名协商)。已用真实华为 OBS Node.js SDK 跑通(`integration/obssdk_test.go` + `integration/testdata/obs-js/`,npm 装在 testdata 下以免 `go test ./...` 扫到 node_modules):put/get/head/list/range/presigned-GET/delete 全过。
-  - ⚠️ **已知限制:经 OBS SDK 调 CopyObject 会让 gofakes3 panic**(它在 url-decode 前就按 `/` 切 URL 编码的 `X-Amz-Copy-Source`,见 `gofakes3.go:737`)——属 gofakes3 层 bug,我们的 `Backend.CopyObject` 本身正确(Go 测试覆盖)。第二阶段(自控 S3 层 / 迁 versitygw / 给 gofakes3 打补丁)修复。
+  - **CopyObject 经 OBS SDK 已修复**:OBS SDK 把 `X-Amz-Copy-Source` 整体百分号编码(连 `/` 也编码),raw gofakes3 在 url-decode 前按 `/` 切会 panic(`gofakes3.go:734` 的 `parts[1]`)。已由 `s3gw.FixCopySourceHandler` 中间件(`Wrap` 套在 gofakes3 前)规范化该头修复;`copysource_test.go` 覆盖规范化逻辑,`integration/obssdk_test.go` 用真实 OBS SDK 实测复制通过。`Backend.CopyObject` 本身是零拷贝(只改 `bucket/key→root` 映射)。
 - **图片处理 = 仅 `image/resize`**(华为 `?x-image-process=image/resize,w_,h_,m_` 语法,`s3gw.ImageProcessHandler` + `internal/imageproc`),刻意不做华为云完整图片处理;**派生图不缓存**(每次实时算),大图(>20MB)拒绝,非图片对象返回 400,不识别的 spec 透传原图。视频截图(MPC)未做。
 
 ## 11. 文档地图

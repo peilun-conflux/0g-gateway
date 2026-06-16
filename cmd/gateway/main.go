@@ -108,14 +108,15 @@ func main() {
 	go w.Run(ctx, flushInterval)
 
 	// The S3-compatible endpoint (gofakes3) is the gateway's sole interface:
-	// OBS/S3 SDK clients address objects by bucket+key. The handler is wrapped
-	// with Huawei-OBS-style image processing (?x-image-process=image/resize,...).
+	// OBS/S3 SDK clients address objects by bucket+key. Wrap applies the S3-compat
+	// middlewares (X-Amz-Copy-Source normalization + Huawei-OBS-style image
+	// processing ?x-image-process=image/resize,...) in front of gofakes3.
 	// No signature verification — keep it bound to an internal interface only.
 	s3Backend := s3gw.New(svc, st)
 	faker := gofakes3.New(s3Backend, gofakes3.WithAutoBucket(true))
 	httpSrv := &http.Server{
 		Addr:    listen,
-		Handler: s3Backend.ImageProcessHandler(faker.Server()),
+		Handler: s3Backend.Wrap(faker.Server()),
 		// ReadHeaderTimeout bounds slow-header (Slowloris) clients without
 		// capping body transfer time, since objects can be multi-GB and take a
 		// while to stream. IdleTimeout reaps idle keep-alive connections.

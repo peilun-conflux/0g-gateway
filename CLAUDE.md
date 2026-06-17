@@ -115,6 +115,11 @@ make e2e     # ZGS_E2E=1 真网端到端，需 ZGS_PRIVATE_KEY
 ```
 单测用 fake(`fakeDL` / `fakeChain`)隔离 0G,毫秒级。**提交前**至少 `go test -race ./...` + `gofmt -l`(应为空)+ `go vet`。
 
+**真网 e2e(`ZGS_E2E=1`,需 `ZGS_PRIVATE_KEY` 在宿主链测试网有 gas)**:
+- `TestLiveE2ESDK`(`e2e_sdk_test.go`)——**推荐**:真实华为 OBS **Java** SDK 经 HTTP 打网关 → 真 0G。`putObject` → worker 提交 Flow tx + 上传分片 → finalized → 删本地缓存 → `getObject` 触发**带 proof 的 0G 冷读**并校验字节。需 JDK + bundle jar(同 `obssdkjava_test.go`,缺则 skip)。
+- `TestLiveE2E`(`e2e_test.go`)——较底层:直接调内部 `object.Service`/`uploader`(不走 SDK/HTTP),用于单独验证 chain 后端。
+- 跑法:`set -a; . ./.env; set +a; ZGS_E2E=1 go test ./integration/ -run TestLiveE2ESDK -v -timeout 12m`(key 放 gitignored `.env`)。
+
 ## 8. 编码约定(改代码时遵守)
 
 - 风格贴合现有代码:注释解释「**为什么**」(不变量、崩溃语义、SDK 行为),而非复述代码。

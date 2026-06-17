@@ -23,14 +23,20 @@ import (
 )
 
 type Backend struct {
+	// ctx is the gateway's lifecycle context. gofakes3's Backend interface does
+	// not pass the per-request context down, so a cold read from 0G (a possibly
+	// slow, proof-verified download) cannot be tied to the HTTP request and
+	// canceled on client disconnect. Tying it to ctx at least cancels in-flight
+	// cold reads on server shutdown instead of leaking them.
+	ctx context.Context
 	svc *object.Service
 	st  *store.Store
 }
 
 var _ gofakes3.Backend = (*Backend)(nil)
 
-func New(svc *object.Service, st *store.Store) *Backend {
-	return &Backend{svc: svc, st: st}
+func New(ctx context.Context, svc *object.Service, st *store.Store) *Backend {
+	return &Backend{ctx: ctx, svc: svc, st: st}
 }
 
 // --- buckets ---
@@ -103,7 +109,7 @@ func (b *Backend) PutObject(bucketName, key string, meta map[string]string, inpu
 		}
 	}
 
-	m, _, err := b.svc.Put(context.Background(), input, path.Base(key), contentType(meta))
+	m, _, err := b.svc.Put(b.ctx, input, path.Base(key), contentType(meta))
 	if err != nil {
 		switch {
 		case errors.Is(err, object.ErrEmpty):
@@ -151,7 +157,7 @@ func (b *Backend) GetObject(bucketName, objectName string, rangeRequest *gofakes
 		return nil, err
 	}
 
-	f, m, err := b.svc.Open(context.Background(), root)
+	f, m, err := b.svc.Open(b.ctx, root)
 	if err != nil {
 		if errors.Is(err, object.ErrNotFound) {
 			return nil, gofakes3.KeyNotFound(objectName)

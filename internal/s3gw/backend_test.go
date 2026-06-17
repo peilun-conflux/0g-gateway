@@ -42,7 +42,7 @@ func newBackend(t *testing.T) (*Backend, *store.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(svc, st), st
+	return New(context.Background(), svc, st), st
 }
 
 func put(t *testing.T, b *Backend, bucket, key string, content []byte, ctype string) {

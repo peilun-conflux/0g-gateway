@@ -112,7 +112,7 @@ func main() {
 	// middlewares (X-Amz-Copy-Source normalization + Huawei-OBS-style image
 	// processing ?x-image-process=image/resize,...) in front of gofakes3.
 	// No signature verification — keep it bound to an internal interface only.
-	s3Backend := s3gw.New(svc, st)
+	s3Backend := s3gw.New(ctx, svc, st)
 	faker := gofakes3.New(s3Backend, gofakes3.WithAutoBucket(true))
 	httpSrv := &http.Server{
 		Addr:    listen,

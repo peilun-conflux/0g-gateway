@@ -16,6 +16,7 @@
 package integration
 
 import (
+	"context"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -29,15 +30,26 @@ import (
 	"zgs-gateway/internal/store"
 )
 
+// workingJDKTool resolves a JDK tool and verifies it actually runs. On macOS,
+// /usr/bin/java[c] are stubs that exist on PATH (so LookPath succeeds) but exit
+// non-zero with "Unable to locate a Java Runtime" when no JDK is installed —
+// running `-version` is required to tell a real tool from the stub, otherwise
+// `go test ./...` fails on such machines instead of skipping.
+func workingJDKTool(t *testing.T, name string) string {
+	t.Helper()
+	p, err := exec.LookPath(name)
+	if err != nil {
+		t.Skipf("%s not on PATH; skipping OBS Java SDK compatibility test", name)
+	}
+	if err := exec.Command(p, "-version").Run(); err != nil {
+		t.Skipf("%s is not a working JDK (%v); skipping OBS Java SDK compatibility test", name, err)
+	}
+	return p
+}
+
 func TestOBSJavaSDK(t *testing.T) {
-	javac, err := exec.LookPath("javac")
-	if err != nil {
-		t.Skip("javac not on PATH; skipping OBS Java SDK compatibility test")
-	}
-	java, err := exec.LookPath("java")
-	if err != nil {
-		t.Skip("java not on PATH; skipping OBS Java SDK compatibility test")
-	}
+	javac := workingJDKTool(t, "javac")
+	java := workingJDKTool(t, "java")
 	dir := filepath.Join("testdata", "obs-java")
 	jars, _ := filepath.Glob(filepath.Join(dir, "lib", "esdk-obs-java-bundle-*.jar"))
 	if len(jars) == 0 {
@@ -62,7 +74,7 @@ func TestOBSJavaSDK(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b := s3gw.New(svc, st)
+	b := s3gw.New(context.Background(), svc, st)
 	faker := gofakes3.New(b, gofakes3.WithAutoBucket(true))
 	ts := httptest.NewServer(b.Wrap(faker.Server())) // same middleware stack as main.go
 	defer ts.Close()

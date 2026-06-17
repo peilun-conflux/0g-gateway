@@ -16,6 +16,7 @@ type fakeChain struct {
 	batches     [][]Item
 	uploadErr   error
 	status      map[string]FileStatus
+	statusErr   error // when set, FileStatus fails (nodes unreachable)
 	statusCalls map[string]int
 	txHash      string
 }
@@ -40,6 +41,9 @@ func (f *fakeChain) FileStatus(_ context.Context, root string) (FileStatus, erro
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.statusCalls[root]++
+	if f.statusErr != nil {
+		return FileUnknown, f.statusErr
+	}
 	return f.status[root], nil
 }
 
@@ -127,6 +131,34 @@ func TestSkipTxKeepsExistingTxHash(t *testing.T) {
 	}
 	if m.TxHash != "0xORIGINAL" {
 		t.Fatalf("SkipTx item lost its original txHash: got %q want 0xORIGINAL", m.TxHash)
+	}
+}
+
+func TestReconcileErrorDefersAmbiguousItem(t *testing.T) {
+	ch := newFakeChain()
+	ch.statusErr = errors.New("all storage nodes unreachable")
+	w, st := setup(t, ch, Config{BatchMax: 10, MaxRetries: 3})
+	roots := addPending(t, st, 1)
+	// a "submitted" crash leftover: its on-chain status is ambiguous, and
+	// FileStatus can't be reached to reconcile it
+	if err := st.SetStatus(roots[0], store.StatusSubmitted, "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Flush(context.Background()); err == nil {
+		t.Fatal("flush should surface the reconcile error")
+	}
+	// it must NOT be re-uploaded while its on-chain status is unknown
+	if len(ch.batches) != 0 {
+		t.Fatalf("ambiguous item uploaded despite unknown on-chain status: %+v", ch.batches)
+	}
+	// and it stays queued (unchanged) for a later flush
+	m, _, _ := st.Get(roots[0])
+	if m.Status != store.StatusSubmitted {
+		t.Fatalf("deferred item status changed: %+v", m)
+	}
+	if q, _ := st.UploadQueue(10); len(q) != 1 {
+		t.Fatalf("deferred item dropped from queue: %d", len(q))
 	}
 }
 

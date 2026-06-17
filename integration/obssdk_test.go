@@ -50,7 +50,7 @@ func TestOBSJavaScriptSDK(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b := s3gw.New(svc, st)
+	b := s3gw.New(context.Background(), svc, st)
 	faker := gofakes3.New(b, gofakes3.WithAutoBucket(true))
 	ts := httptest.NewServer(b.Wrap(faker.Server())) // same middleware stack as main.go
 	defer ts.Close()

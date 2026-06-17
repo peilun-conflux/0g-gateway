@@ -84,6 +84,7 @@ func (w *Worker) processBatch(ctx context.Context, batch []store.ObjectMeta) err
 	// Reconcile crash leftovers (submitted) and retried items against the
 	// nodes before re-submitting; fresh pending items skip the extra RPC.
 	items := make([]Item, 0, len(batch))
+	var deferred error
 	for _, m := range batch {
 		// The queue was snapshotted up front, so re-read each object to pick up
 		// any state change a concurrent PUT landed since (e.g. a salvage that
@@ -97,18 +98,27 @@ func (w *Worker) processBatch(ctx context.Context, batch []store.ObjectMeta) err
 		}
 		m = cur
 		if m.Status == store.StatusSubmitted || m.Retries > 0 {
-			switch st, err := w.ch.FileStatus(ctx, m.Root); {
-			case err != nil:
-				// transient node trouble: keep the stored SkipTx decision
-			case st == FileFinalized:
+			st, err := w.ch.FileStatus(ctx, m.Root)
+			if err != nil {
+				// We can't tell whether this item's prior tx already landed on
+				// chain. Re-submitting now could duplicate it (double upload /
+				// wasted gas), so defer it to a later flush rather than uploading
+				// blind. Its status is left unchanged, so it stays queued.
+				if deferred == nil {
+					deferred = fmt.Errorf("reconcile %s: %w", m.Root, err)
+				}
+				continue
+			}
+			switch st {
+			case FileFinalized:
 				if err := w.st.SetStatus(m.Root, store.StatusFinalized, "", ""); err != nil {
 					return err
 				}
 				continue
-			case st == FileUploading:
+			case FileUploading:
 				m.SkipTx = true
 				_ = w.st.SetSkipTx(m.Root, true)
-			case st == FileUnknown, st == FilePruned:
+			case FileUnknown, FilePruned:
 				// entry not (or no longer) on chain: needs a fresh tx
 				m.SkipTx = false
 				_ = w.st.SetSkipTx(m.Root, false)
@@ -117,7 +127,7 @@ func (w *Worker) processBatch(ctx context.Context, batch []store.ObjectMeta) err
 		items = append(items, Item{Root: m.Root, Path: w.cfg.PathOf(m.Root), SkipTx: m.SkipTx})
 	}
 	if len(items) == 0 {
-		return nil
+		return deferred
 	}
 
 	for _, it := range items {
@@ -144,7 +154,7 @@ func (w *Worker) processBatch(ctx context.Context, batch []store.ObjectMeta) err
 			return err
 		}
 	}
-	return nil
+	return deferred
 }
 
 // reconcileFailedBatch classifies every member of a failed batch: some may

@@ -16,45 +16,68 @@
 
 | | 状态 |
 |---|---|
-| 实测 SDK | 华为 OBS Node.js SDK **`esdk-obs-nodejs ^3.26.2`**(`integration/testdata/obs-js/`) |
-| 实测覆盖 | 建桶 / 上传 / 下载 / Range / HEAD / 列举 / 复制 / 预签名 GET / 删除 —— **全部通过** |
-| 必须配置 | `signature: 'v2'` + `path_style: true` + `server` 传完整 URL |
+| 实测 SDK | 华为 OBS **Java** SDK `esdk-obs-java-bundle`(实测 3.25.5;对接方 Java 8 + ≥3.21.11)与 **Node.js** SDK `esdk-obs-nodejs 3.26`,均有真机测试(`integration/`) |
+| 实测覆盖 | 建桶 / 上传 / 下载 / Range / HEAD / 列举 / 复制 / 预签名 GET / 删除 —— 两个 SDK **全部通过** |
+| 必须配置 | path-style + S3 v2 签名(见 §1) |
 | 不支持 | Multipart 分段上传、空对象、List 分页、Versioning |
 | 安全 | **不验签名**(demo),只绑内网;预签名 URL 能取到对象但**不被强制**(非访问控制) |
 
 ---
 
-## 1. 连接配置(华为 OBS Node.js SDK,已实测)
+## 1. SDK 连接配置
 
-华为 OBS SDK 默认走 OBS 私有签名协议,需调成 **S3 v2 签名 + 路径风格**:
+华为 OBS SDK 默认走 OBS 私有签名协议,需调成 **S3 v2 签名 + 路径风格**。
+
+### 1.1 华为 OBS Java SDK(对接方使用,已真机实测)
+
+`esdk-obs-java-bundle`(实测 3.25.5;对接方 Java 8 + ≥3.21.11):
+
+```java
+import com.obs.services.ObsClient;
+import com.obs.services.ObsConfiguration;
+import com.obs.services.model.AuthTypeEnum;
+
+ObsConfiguration config = new ObsConfiguration();
+config.setEndPoint("<gateway-host>");      // 仅主机名/IP,不含 scheme
+config.setEndpointHttpPort(8080);          // 端口
+config.setHttpsOnly(false);                // 内网走 http
+config.setPathStyle(true);                 // 必须:路径风格
+config.setAuthTypeNegotiation(false);      // 不与服务端协商,固定签名类型
+config.setAuthType(AuthTypeEnum.V2);       // 必须:S3 v2 签名(不是 OBS 私有协议)
+ObsClient client = new ObsClient("anyAK", "anySK", config); // AK/SK 任意非空值
+```
+
+要点:
+- **`setPathStyle(true)`** + **`setAuthType(AuthTypeEnum.V2)`** + **`setAuthTypeNegotiation(false)`** 缺一不可。
+- **无需** `setVerifyResponseContentType(false)`:网关已在服务端把 XML 响应的 `Content-Type` 规范化为 `application/xml`,SDK 保持**默认严格校验**即可正常用(否则 SDK 会因 gofakes3 的 `text/xml; charset=utf-8` 报「Expected XML document response」)。
+- AK/SK 任意非空值——网关不验证签名(见 §5.2)。
+
+> 实测脚本见 `integration/testdata/obs-java/ObsCompatTest.java`(由 `integration/obssdkjava_test.go` 驱动),覆盖 §2 全部操作。
+
+### 1.2 华为 OBS Node.js SDK(已真机实测)
 
 ```js
 const ObsClient = require('esdk-obs-nodejs');
 
 const client = new ObsClient({
   access_key_id:     'anyAK',                       // 任意非空值;网关不验签名
-  secret_access_key: 'anySK',                       // 任意非空值
+  secret_access_key: 'anySK',
   server:            'http://<gateway-host>:8080',  // 完整 URL(含 http:// 与端口)
   signature:         'v2',                          // 必须;默认 'obs' 走不通
   path_style:        true,                          // 必须;不支持 virtual-host 风格
 });
 ```
+host 为 **IP** 时 SDK 会自动选 path-style 并关闭签名协议协商;用域名时把上面两项显式给上即可。
 
-四项缺一不可:
-- **`signature: 'v2'`** —— 用 S3 v2 签名,**不是**默认的 `'obs'`(OBS 私有协议网关不认)。
-- **`path_style: true`** —— 网关只支持路径风格 `http://host/bucket/key`,不支持 `http://bucket.host/key`。
-- **`server` 传完整 URL** —— 含 `http://` 和端口。当 host 是 **IP** 时,SDK 会自动选路径风格并关闭签名协议协商;用域名时把上面两项显式给上即可。
-- **AK/SK 任意非空值** —— 网关不验证签名(见 §5.2)。
+### 1.3 其它 S3 SDK(AWS SDK / boto3 等)
 
-> **其它语言的 OBS SDK(Java / Python / Go 等)**:对接原理相同 —— endpoint 指向网关、强制
-> **path-style**、签名用 **S3 v2**、AK/SK 任意。这些语言**未逐一实测**,接入前建议先用下面 §6 的
-> 命令行/Node.js 脚本验证连通性。如需某语言的确认结论请提出,我们补测。
+原理相同:endpoint 指向网关、强制 path-style、AK/SK 任意非空。**未逐一实测**,接入前建议先用 §6 的 `aws s3api` 验证连通性。
 
 ---
 
 ## 2. 已支持的操作(经华为 OBS SDK 实测通过)
 
-下列调用均由真实 OBS Node.js SDK 跑通(见 `integration/testdata/obs-js/obs_sdk_test.js`):
+下列调用经真实华为 OBS **Java** 与 **Node.js** SDK 跑通(`integration/testdata/obs-java/ObsCompatTest.java` 与 `…/obs-js/obs_sdk_test.js`):
 
 | OBS SDK 方法 | 行为 / 说明 |
 |---|---|

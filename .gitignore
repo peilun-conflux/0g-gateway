@@ -3,3 +3,6 @@
 .env
 .DS_Store
 node_modules/
+# OBS Java SDK test: bundle jar (fetched on demand) and compiled classes
+/integration/testdata/obs-java/lib/
+*.class

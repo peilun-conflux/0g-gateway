@@ -7,11 +7,12 @@ import (
 )
 
 // Wrap applies the gateway's S3-compatibility HTTP middlewares in front of the
-// gofakes3 handler: X-Amz-Copy-Source normalization and on-the-fly image
-// processing. main.go and the integration harness both use it so the middleware
-// stack can't drift between production and tests.
+// gofakes3 handler: X-Amz-Copy-Source normalization, on-the-fly image
+// processing, and XML-response Content-Type normalization (for the strict
+// Huawei OBS Java SDK). main.go and the integration harness both use it so the
+// middleware stack can't drift between production and tests.
 func (b *Backend) Wrap(next http.Handler) http.Handler {
-	return b.FixCopySourceHandler(b.ImageProcessHandler(next))
+	return b.FixCopySourceHandler(b.ImageProcessHandler(b.FixXMLContentTypeHandler(next)))
 }
 
 // FixCopySourceHandler rewrites the X-Amz-Copy-Source header into the exact form

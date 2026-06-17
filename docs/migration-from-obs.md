@@ -16,7 +16,7 @@
 
 | | 状态 |
 |---|---|
-| 实测 SDK | 华为 OBS **Java** SDK `esdk-obs-java-bundle`(实测 3.25.5;对接方 Java 8 + ≥3.21.11)与 **Node.js** SDK `esdk-obs-nodejs 3.26`,均有真机测试(`integration/`) |
+| 实测 SDK | 华为 OBS **Java** SDK `esdk-obs-java-bundle`(实测 **3.21.11 与 3.25.5**;对接方 Java 8 + ≥3.21.11)与 **Node.js** SDK `esdk-obs-nodejs 3.26`,均有真机测试(`integration/`) |
 | 实测覆盖 | 建桶 / 上传 / 下载 / Range / HEAD / 列举 / 复制 / 预签名 GET / 删除 —— 两个 SDK **全部通过** |
 | 必须配置 | path-style + S3 v2 签名(见 §1) |
 | 不支持 | Multipart 分段上传、空对象、List 分页、Versioning |
@@ -30,7 +30,7 @@
 
 ### 1.1 华为 OBS Java SDK(对接方使用,已真机实测)
 
-`esdk-obs-java-bundle`(实测 3.25.5;对接方 Java 8 + ≥3.21.11):
+`esdk-obs-java-bundle`(实测 3.21.11 与 3.25.5;对接方 Java 8 + ≥3.21.11):
 
 ```java
 import com.obs.services.ObsClient;

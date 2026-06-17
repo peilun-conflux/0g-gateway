@@ -2,11 +2,13 @@
 // s3gw, backed by a local object.Service — no real 0G) with the real Huawei OBS
 // *Java* SDK (esdk-obs-java-bundle), which is what the integration partner uses.
 //
-// It auto-skips unless a JDK (javac/java) is on PATH and the OBS Java bundle jar
-// is present:
+// It auto-skips unless a JDK (javac/java) is on PATH and an OBS Java bundle jar
+// (esdk-obs-java-bundle-*.jar) is present under testdata/obs-java/lib/. Any 3.x
+// bundle works; the partner uses >=3.21.11. Fetch one with, e.g.:
 //
-//	curl -sLo integration/testdata/obs-java/lib/esdk-obs-java-bundle-3.25.5.jar \
-//	  https://repo1.maven.org/maven2/com/huaweicloud/esdk-obs-java-bundle/3.25.5/esdk-obs-java-bundle-3.25.5.jar
+//	V=3.21.11
+//	curl -sLo integration/testdata/obs-java/lib/esdk-obs-java-bundle-$V.jar \
+//	  https://repo1.maven.org/maven2/com/huaweicloud/esdk-obs-java-bundle/$V/esdk-obs-java-bundle-$V.jar
 //	go test ./integration/ -run TestOBSJavaSDK -v
 //
 // The jar and compiled .class files live under testdata/ (git-ignored) so
@@ -37,10 +39,12 @@ func TestOBSJavaSDK(t *testing.T) {
 		t.Skip("java not on PATH; skipping OBS Java SDK compatibility test")
 	}
 	dir := filepath.Join("testdata", "obs-java")
-	jar := filepath.Join(dir, "lib", "esdk-obs-java-bundle-3.25.5.jar")
-	if _, err := os.Stat(jar); err != nil {
-		t.Skipf("OBS Java bundle jar not present (%s); see this file's header for the curl command", jar)
+	jars, _ := filepath.Glob(filepath.Join(dir, "lib", "esdk-obs-java-bundle-*.jar"))
+	if len(jars) == 0 {
+		t.Skip("OBS Java bundle jar not present under testdata/obs-java/lib/; see this file's header for the fetch command")
 	}
+	jar := jars[0] // any 3.x bundle works; the partner uses >=3.21.11
+	t.Logf("using OBS Java bundle: %s", jar)
 
 	// Compile ObsCompatTest.java into a temp dir against the bundle jar.
 	classes := t.TempDir()

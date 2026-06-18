@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"fmt"
 	"image"
 	"image/png"
 	"io"
@@ -43,6 +44,84 @@ func newBackend(t *testing.T) (*Backend, *store.Store) {
 		t.Fatal(err)
 	}
 	return New(context.Background(), svc, st), st
+}
+
+func newBackendCache(t *testing.T, cacheMax int64) (*Backend, *store.Store) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	svc, err := object.New(st, &fakeDL{data: map[string][]byte{}}, object.Config{DataDir: t.TempDir(), CacheMaxBytes: cacheMax})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return New(context.Background(), svc, st), st
+}
+
+func TestBackpressureSlowDownOnSaturatedCache(t *testing.T) {
+	b, st := newBackendCache(t, 250) // low-water 225
+	if err := b.CreateBucket("demo"); err != nil {
+		t.Fatal(err)
+	}
+	// Fill the cache past the limit with pending objects. No worker runs, so
+	// nothing finalizes and nothing is evictable: the cache is stuck over limit.
+	for i := 0; i < 4; i++ {
+		// Distinct content per object, else dedup collapses them to one cache file.
+		put(t, b, "demo", fmt.Sprintf("k%d", i), bytes.Repeat([]byte{byte('a' + i)}, 100), "application/octet-stream")
+	}
+
+	called := false
+	h := b.Wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { called = true; w.WriteHeader(http.StatusOK) }))
+
+	serve := func(req *http.Request) *httptest.ResponseRecorder {
+		called = false
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// An object PUT is shed with 503 SlowDown before reaching the backend.
+	rec := serve(httptest.NewRequest(http.MethodPut, "/demo/new.bin", bytes.NewReader([]byte("data"))))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("PUT under pressure: status = %d, want 503", rec.Code)
+	}
+	if called {
+		t.Fatal("upload should have been shed before reaching the backend")
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte("SlowDown")) {
+		t.Fatalf("expected SlowDown body, got %q", rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("expected a Retry-After header")
+	}
+
+	// Reads are never throttled — they must keep working under write pressure.
+	if rec := serve(httptest.NewRequest(http.MethodGet, "/demo/k0", nil)); !called {
+		t.Fatalf("GET should pass through backpressure (status %d)", rec.Code)
+	}
+
+	// A zero-copy server-side copy adds no cache bytes, so it is not throttled.
+	cp := httptest.NewRequest(http.MethodPut, "/demo/copy.bin", nil)
+	cp.Header.Set("X-Amz-Copy-Source", "/demo/k0")
+	if serve(cp); !called {
+		t.Fatal("server-side copy should pass through backpressure")
+	}
+
+	// Once the backlog finalizes, eviction reclaims space and writes resume.
+	q, err := st.UploadQueue(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range q {
+		if err := st.SetStatus(m.Root, store.StatusFinalized, "", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if rec := serve(httptest.NewRequest(http.MethodPut, "/demo/after.bin", bytes.NewReader([]byte("data")))); !called {
+		t.Fatalf("PUT should resume after the backlog finalizes (status %d)", rec.Code)
+	}
 }
 
 func put(t *testing.T, b *Backend, bucket, key string, content []byte, ctype string) {

@@ -16,10 +16,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/0gfoundation/0g-storage-client/core"
 
@@ -38,8 +42,9 @@ type Downloader interface {
 }
 
 type Config struct {
-	DataDir string // cache root; spool files live under DataDir/tmp
-	MaxSize int64  // max object size in bytes; 0 = unlimited
+	DataDir       string // cache root; spool files live under DataDir/tmp
+	MaxSize       int64  // max object size in bytes; 0 = unlimited
+	CacheMaxBytes int64  // cache dir size that triggers finalized-LRU eviction; 0 = unbounded
 }
 
 type Service struct {
@@ -48,6 +53,13 @@ type Service struct {
 	cfg    Config
 	objDir string
 	tmpDir string
+
+	// cacheBytes is a best-effort running total of the cache directory size,
+	// seeded by an exact scan at startup and adjusted as files are added/evicted;
+	// any drift self-heals on the next restart. Only meaningful when
+	// CacheMaxBytes > 0. evicting single-flights the eviction sweep.
+	cacheBytes atomic.Int64
+	evicting   atomic.Bool
 }
 
 func New(st *store.Store, dl Downloader, cfg Config) (*Service, error) {
@@ -58,7 +70,19 @@ func New(st *store.Store, dl Downloader, cfg Config) (*Service, error) {
 			return nil, err
 		}
 	}
-	return &Service{st: st, dl: dl, cfg: cfg, objDir: objDir, tmpDir: tmpDir}, nil
+	s := &Service{st: st, dl: dl, cfg: cfg, objDir: objDir, tmpDir: tmpDir}
+	// Spool/download temp files have unique names and are never reused, so any
+	// left in tmp/ are debris from an interrupted PUT or cold read — clear them.
+	clearDir(tmpDir)
+	if cfg.CacheMaxBytes > 0 {
+		total, err := dirSize(objDir)
+		if err != nil {
+			return nil, fmt.Errorf("size cache dir: %w", err)
+		}
+		s.cacheBytes.Store(total)
+		s.evictIfNeeded() // a restart with a lowered limit should trim down now
+	}
+	return s, nil
 }
 
 // CachePath returns the cache file location for a root (exists or not).
@@ -69,6 +93,119 @@ func (s *Service) CachePath(root string) string {
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
+}
+
+// clearDir removes the (non-directory) entries directly under dir, best-effort.
+func clearDir(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			_ = os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
+}
+
+// dirSize sums the sizes of the regular files directly under dir.
+func dirSize(dir string) (int64, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if fi, err := e.Info(); err == nil {
+			total += fi.Size()
+		}
+	}
+	return total, nil
+}
+
+// touchInterval coarsens LRU updates so the read path stays write-free in the
+// common case; minute-granularity recency is plenty for cache eviction.
+const touchInterval = time.Minute
+
+// noteAdded accounts for a freshly materialized cache file (fresh PUT, salvage,
+// or cold-read restore) and triggers eviction when the cache has grown past its
+// limit. A no-op when the cache is unbounded.
+func (s *Service) noteAdded(size int64) {
+	if s.cfg.CacheMaxBytes <= 0 {
+		return
+	}
+	s.cacheBytes.Add(size)
+	s.evictIfNeeded()
+}
+
+// touch bumps an object's LRU recency, but only when eviction is enabled and the
+// recorded access is stale enough to matter — so reads write metadata at most
+// once per touchInterval per object, and never at all when the cache is unbounded.
+func (s *Service) touch(root string, last time.Time) {
+	if s.cfg.CacheMaxBytes <= 0 || time.Since(last) < touchInterval {
+		return
+	}
+	if err := s.st.Touch(root, time.Now().UTC()); err != nil {
+		slog.Warn("cache lru touch", "root", root, "err", err)
+	}
+}
+
+// ShouldRejectWrite reports whether a new upload must be shed for backpressure:
+// the cache is over its limit and eviction can't reclaim enough because the
+// overflow is not-yet-finalized data (whose cache file is its only copy and so
+// is never evictable). It first attempts a reclaim, so it only returns true when
+// the gateway is genuinely stuck — i.e. ingest is outrunning finalization. The
+// caller (s3gw) turns a true into a retryable 503 SlowDown. Always false when
+// the cache is unbounded.
+func (s *Service) ShouldRejectWrite() bool {
+	if s.cfg.CacheMaxBytes <= 0 {
+		return false
+	}
+	s.evictIfNeeded() // reclaim finalized space first; reject only if still over
+	return s.cacheBytes.Load() > s.cfg.CacheMaxBytes
+}
+
+// evictIfNeeded drops the least-recently-used FINALIZED objects' cache files
+// until the cache is back under a low-water mark. Non-finalized objects are
+// never evicted (their cache file is the only copy until 0G finalization);
+// finalized objects are safe to drop because Open restores them from 0G
+// (proof-verified) on the next read. One evictor runs at a time; concurrent
+// callers return immediately.
+func (s *Service) evictIfNeeded() {
+	limit := s.cfg.CacheMaxBytes
+	if limit <= 0 || s.cacheBytes.Load() <= limit {
+		return
+	}
+	if !s.evicting.CompareAndSwap(false, true) {
+		return // another goroutine is already evicting
+	}
+	defer s.evicting.Store(false)
+
+	low := limit - limit/10 // 10% headroom so we don't evict on every PUT
+	cands, err := s.st.FinalizedCacheEntries()
+	if err != nil {
+		slog.Warn("cache eviction: list candidates", "err", err)
+		return
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i].LastAccess.Before(cands[j].LastAccess) })
+	for _, c := range cands {
+		if s.cacheBytes.Load() <= low {
+			break
+		}
+		p := s.CachePath(c.Root)
+		fi, err := os.Stat(p)
+		if err != nil {
+			continue // already evicted / never cached
+		}
+		if err := os.Remove(p); err != nil {
+			slog.Warn("cache eviction: remove", "root", c.Root, "err", err)
+			continue
+		}
+		s.cacheBytes.Add(-fi.Size())
+	}
 }
 
 // materialize fsyncs the spool file and atomically moves it into the cache at
@@ -144,6 +281,7 @@ func (s *Service) Put(ctx context.Context, r io.Reader, filename, contentType st
 			if err := materialize(tmp, tmpPath, s.CachePath(m.Root)); err != nil {
 				return store.ObjectMeta{}, false, err
 			}
+			s.noteAdded(m.Size)
 			if err := s.st.Reenqueue(m.Root); err != nil {
 				return store.ObjectMeta{}, false, err
 			}
@@ -183,6 +321,9 @@ func (s *Service) Put(ctx context.Context, r io.Reader, filename, contentType st
 		os.Remove(tmpPath)
 		return store.ObjectMeta{}, false, err
 	}
+	// The new object is not finalized yet, so eviction here can only reclaim
+	// OTHER finalized objects — never the bytes just written.
+	s.noteAdded(n)
 
 	m := store.ObjectMeta{
 		Root:        root,
@@ -224,6 +365,7 @@ func (s *Service) Open(ctx context.Context, root string) (*os.File, store.Object
 		// on success. (Re-hashing every read would be prohibitive for large
 		// objects, so size is the cheap local integrity gate.)
 		if fi, statErr := f.Stat(); statErr == nil && fi.Size() == m.Size {
+			s.touch(root, m.LastAccess)
 			return f, m, nil
 		}
 		f.Close()
@@ -242,5 +384,16 @@ func (s *Service) Open(ctx context.Context, root string) (*os.File, store.Object
 		return nil, m, err
 	}
 	f, err := os.Open(p)
-	return f, m, err
+	if err != nil {
+		return nil, m, err
+	}
+	// Mark freshest in the LRU BEFORE accounting for the bytes: the open handle
+	// above survives an unlink, so even if a racing eviction targets this root
+	// the served bytes are safe — but bumping recency first keeps the object we
+	// just paid to restore from being the immediate eviction victim.
+	if s.cfg.CacheMaxBytes > 0 {
+		_ = s.st.Touch(root, time.Now().UTC())
+	}
+	s.noteAdded(m.Size)
+	return f, m, nil
 }

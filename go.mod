@@ -8,6 +8,7 @@ require (
 	github.com/johannesboyne/gofakes3 v0.0.0-20260208201424-4c385a1f6a73
 	github.com/openweb3/web3go v0.2.9
 	go.etcd.io/bbolt v1.4.3
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

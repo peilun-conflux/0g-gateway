@@ -59,6 +59,14 @@ type ObjectMeta struct {
 	SkipTx      bool      `json:"skipTx,omitempty"` // reconcile decided the entry is already on chain
 	CreatedAt   time.Time `json:"createdAt"`
 	UpdatedAt   time.Time `json:"updatedAt"`
+	LastAccess  time.Time `json:"lastAccess,omitempty"` // last read; drives finalized-cache LRU eviction
+}
+
+// CacheEntry is the eviction-relevant projection of one object.
+type CacheEntry struct {
+	Root       string
+	Size       int64
+	LastAccess time.Time
 }
 
 var (
@@ -144,7 +152,7 @@ func (s *Store) CreateObject(m ObjectMeta) error {
 			return ErrExists
 		}
 		now := time.Now().UTC()
-		m.CreatedAt, m.UpdatedAt = now, now
+		m.CreatedAt, m.UpdatedAt, m.LastAccess = now, now, now
 		if err := putMeta(tx, m); err != nil {
 			return err
 		}
@@ -238,6 +246,42 @@ func (s *Store) IncRetries(root string) (int, error) {
 func (s *Store) SetSkipTx(root string, v bool) error {
 	_, err := s.mutate(root, func(m *ObjectMeta) { m.SkipTx = v })
 	return err
+}
+
+// Touch records a read access time, feeding the finalized-cache LRU. It does
+// NOT bump UpdatedAt or touch queue membership — a read is not a state
+// transition — and a missing object is a no-op. The caller supplies the clock
+// so eviction ordering is testable.
+func (s *Store) Touch(root string, at time.Time) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		m, ok, err := getMeta(tx, root)
+		if err != nil || !ok {
+			return err
+		}
+		m.LastAccess = at.UTC()
+		return putMeta(tx, m)
+	})
+}
+
+// FinalizedCacheEntries returns (root, size, last access) for every finalized
+// object. Only finalized objects are eviction candidates: their bytes are
+// durably on 0G and a cold read restores them, whereas a non-finalized object's
+// cache file is its only copy.
+func (s *Store) FinalizedCacheEntries() ([]CacheEntry, error) {
+	var out []CacheEntry
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketObjects).ForEach(func(_, v []byte) error {
+			var m ObjectMeta
+			if err := json.Unmarshal(v, &m); err != nil {
+				return err
+			}
+			if m.Status == StatusFinalized {
+				out = append(out, CacheEntry{Root: m.Root, Size: m.Size, LastAccess: m.LastAccess})
+			}
+			return nil
+		})
+	})
+	return out, err
 }
 
 // --- S3-style bucket + object-key index (gofakes3 layer) ---

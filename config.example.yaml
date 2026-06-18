@@ -1,0 +1,46 @@
+# zgs-gateway configuration.
+#
+# Copy this file to config.yaml and edit it, then run:
+#     ./bin/gateway --config config.yaml
+# (./config.yaml is picked up automatically if --config is omitted.)
+#
+# Every value can also be set through an environment variable; the environment
+# always overrides the file, which is convenient for injecting secrets such as
+# private_key into a container. See .env.example for the variable names.
+
+# --- Required: 0G backend ---
+
+# Storage-node JSON-RPC endpoints.
+nodes:
+  - http://47.84.224.253:5678
+  - http://47.84.225.228:5678
+
+# Host-chain (EVM) RPC where the Flow contract lives.
+eth_rpc: https://evmtestnet.confluxrpc.com
+
+# Signer account private key (hex, no 0x prefix); must hold gas on the host
+# chain. Prefer injecting this via the ZGS_PRIVATE_KEY environment variable or a
+# secrets manager rather than committing it to a file.
+private_key: ""
+
+# --- Optional: endpoint and storage ---
+
+# S3-compatible endpoint listen address. The endpoint does NOT verify
+# signatures, so bind it to an internal interface only (e.g. 127.0.0.1:8080),
+# never 0.0.0.0 or a public address.
+listen: ":8080"
+
+# Local cache + bbolt metadata directory.
+data_dir: ./data
+
+# --- Optional: tunables ---
+
+max_size: 4294967296          # max object size in bytes (default 4 GiB)
+cache_max_bytes: 10737418240  # local cache cap in bytes (default 10 GiB); 0 = unbounded.
+                              # Finalized objects are evicted LRU (restored from 0G on the next
+                              # read); when the cache fills with not-yet-finalized objects that
+                              # cannot be evicted, new uploads get 503 SlowDown until it drains.
+batch_max: 20                 # max objects per on-chain batch
+flush_interval_ms: 3000       # upload worker flush interval, must be > 0
+max_retries: 5                # on-chain upload retry ceiling
+# expected_replica: 2         # desired replica count (default: number of nodes)

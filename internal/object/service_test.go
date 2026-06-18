@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/0gfoundation/0g-storage-client/core"
 
@@ -43,6 +44,94 @@ func newSvc(t *testing.T, dl Downloader, maxSize int64) (*Service, *store.Store)
 		t.Fatal(err)
 	}
 	return svc, st
+}
+
+func newCacheSvc(t *testing.T, dl Downloader, cacheMax int64) (*Service, *store.Store) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	svc, err := New(st, dl, Config{DataDir: t.TempDir(), CacheMaxBytes: cacheMax})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return svc, st
+}
+
+func TestCacheEvictsLeastRecentlyUsedFinalized(t *testing.T) {
+	dl := &fakeDL{data: map[string][]byte{}}
+	// limit 350, low-water 315: with three 100-byte finalized objects cached,
+	// adding a fourth (400 > 350) should evict exactly one — the LRU.
+	svc, st := newCacheSvc(t, dl, 350)
+
+	put := func() store.ObjectMeta {
+		content := randBytes(t, 100)
+		m, _, err := svc.Put(context.Background(), bytes.NewReader(content), "f", "application/octet-stream")
+		if err != nil {
+			t.Fatal(err)
+		}
+		dl.data[m.Root] = content // so a cold read can restore it post-eviction
+		return m
+	}
+	a, b, c := put(), put(), put()
+
+	now := time.Now().UTC()
+	for i, m := range []store.ObjectMeta{a, b, c} {
+		if err := st.SetStatus(m.Root, store.StatusFinalized, "", ""); err != nil {
+			t.Fatal(err)
+		}
+		// a least-recently-used, c most-recently-used
+		if err := st.Touch(m.Root, now.Add(time.Duration(i-3)*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A fourth, still-pending object pushes the cache over the limit.
+	d := put()
+
+	if fileExists(svc.CachePath(a.Root)) {
+		t.Fatal("least-recently-used finalized object A should have been evicted")
+	}
+	for name, m := range map[string]store.ObjectMeta{"B": b, "C": c, "D(pending)": d} {
+		if !fileExists(svc.CachePath(m.Root)) {
+			t.Fatalf("%s should still be cached", name)
+		}
+	}
+
+	// A cache miss on the evicted object restores it from 0G.
+	before := dl.calls
+	f, _, err := svc.Open(context.Background(), a.Root)
+	if err != nil {
+		t.Fatalf("cold read of evicted object: %v", err)
+	}
+	f.Close()
+	if dl.calls != before+1 {
+		t.Fatalf("expected exactly one cold read, got %d", dl.calls-before)
+	}
+	if !fileExists(svc.CachePath(a.Root)) {
+		t.Fatal("evicted object should be restored to the cache after a cold read")
+	}
+}
+
+func TestCacheNeverEvictsUnfinalized(t *testing.T) {
+	// Far over the limit, but every object is pending: a non-finalized object's
+	// cache file is its only copy, so none may be evicted.
+	svc, _ := newCacheSvc(t, &fakeDL{data: map[string][]byte{}}, 250)
+	var roots []string
+	for i := 0; i < 5; i++ {
+		m, _, err := svc.Put(context.Background(), bytes.NewReader(randBytes(t, 100)), "f", "x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		roots = append(roots, m.Root)
+	}
+	for _, r := range roots {
+		if !fileExists(svc.CachePath(r)) {
+			t.Fatalf("pending object %s was evicted; only finalized objects are evictable", r)
+		}
+	}
 }
 
 func randBytes(t *testing.T, n int) []byte {

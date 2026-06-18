@@ -215,6 +215,18 @@ func (w *Worker) PollFinality(ctx context.Context) error {
 }
 
 // Run loops Flush and PollFinality until ctx is canceled.
+//
+// There is deliberately no panic recovery. An unrecovered panic in this
+// goroutine aborts the whole process (Go crashes on any unrecovered goroutine
+// panic) — the intended fail-fast for the demo, so a worker bug surfaces loudly
+// with a stack trace instead of being swallowed while uploads silently stop.
+// For production, wrap the loop body in recover()+log+continue so a transient
+// panic doesn't take the gateway down.
+//
+// Neither fail-fast nor recovery catches a *hang*: if Flush blocks forever (a
+// stuck node RPC with no per-op timeout) the goroutine never panics or returns,
+// the process stays up, and uploads stall silently. Guarding against that needs
+// a per-operation timeout or a liveness/status signal, not panic handling.
 func (w *Worker) Run(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()

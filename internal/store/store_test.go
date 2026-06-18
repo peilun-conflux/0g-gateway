@@ -50,6 +50,57 @@ func TestCreateGet(t *testing.T) {
 	}
 }
 
+func TestTouchAndFinalizedCacheEntries(t *testing.T) {
+	s := tempStore(t)
+	// Two finalized objects and one still pending: only the finalized ones are
+	// eviction candidates.
+	mustCreate(t, s, ObjectMeta{Root: "0xfin1", SHA256: "s1", Size: 100, Status: StatusPending})
+	mustCreate(t, s, ObjectMeta{Root: "0xfin2", SHA256: "s2", Size: 200, Status: StatusPending})
+	mustCreate(t, s, ObjectMeta{Root: "0xpend", SHA256: "s3", Size: 300, Status: StatusPending})
+	if err := s.SetStatus("0xfin1", StatusFinalized, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetStatus("0xfin2", StatusFinalized, "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Touch records access time without changing status, UpdatedAt or queues.
+	before, _, _ := s.Get("0xfin1")
+	at := time.Now().UTC().Add(-time.Hour)
+	if err := s.Touch("0xfin1", at); err != nil {
+		t.Fatal(err)
+	}
+	after, _, _ := s.Get("0xfin1")
+	if !after.LastAccess.Equal(at) {
+		t.Fatalf("LastAccess = %v, want %v", after.LastAccess, at)
+	}
+	if after.Status != StatusFinalized || !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("Touch disturbed status/UpdatedAt: %+v", after)
+	}
+	// Touch on a missing object is a no-op (no error).
+	if err := s.Touch("0xnope", at); err != nil {
+		t.Fatalf("touch missing: %v", err)
+	}
+
+	ents, err := s.FinalizedCacheEntries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 2 {
+		t.Fatalf("want 2 finalized candidates, got %d: %+v", len(ents), ents)
+	}
+	got := map[string]int64{}
+	for _, e := range ents {
+		got[e.Root] = e.Size
+	}
+	if got["0xfin1"] != 100 || got["0xfin2"] != 200 {
+		t.Fatalf("unexpected candidate sizes: %+v", got)
+	}
+	if _, ok := got["0xpend"]; ok {
+		t.Fatal("pending object must not be an eviction candidate")
+	}
+}
+
 func TestBySHA256(t *testing.T) {
 	s := tempStore(t)
 	mustCreate(t, s, ObjectMeta{Root: "0x01", SHA256: "abcd", Status: StatusPending})

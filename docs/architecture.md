@@ -1,90 +1,133 @@
-# 0G Storage Gateway — 架构与代码说明
+# Architecture
 
-面向开发者的架构 + 代码结构说明(人读)。部署 / 使用 / 配置见 [`../README.md`](../README.md);
-给 AI agent 的维护手册(不变量、坑、约定)见 [`../CLAUDE.md`](../CLAUDE.md);原始设计见
-`../0g-gateway-design.md`。
+A developer-facing overview of the gateway's design and code structure. For deploying,
+configuring, and using it, see the [README](../README.md); for the maintainer's manual
+(invariants, pitfalls, conventions) see [`../CLAUDE.md`](../CLAUDE.md); for the original
+design rationale see `../0g-gateway-design.md`.
 
-## 形态
+## What it is
 
-**S3 兼容端点 → 0G 去中心化存储。** 对外是 **S3 桶 + 对象 key**(`bucket` + `user/123/a.png`),
-内部是**内容寻址**:对象的真实 key 是其内容的 merkle root(`0x…`,服务端生成,天然去重 + 可校验),
-桶/键 → root 的映射由网关维护、对客户端透明。纯 Go、单进程、内嵌 bbolt 存元数据,无外部数据库。
+**An S3-compatible endpoint in front of 0G decentralized storage.** Externally clients use
+S3 `bucket + key` (e.g. `bucket` + `user/123/a.png`); internally the gateway is
+**content-addressed**: an object's true key is the merkle root of its bytes (`0x…`, generated
+server-side, giving free deduplication and verifiability). The gateway maintains the
+bucket/key → root mapping transparently. Pure Go, a single process, with an embedded bbolt
+store for metadata and no external database.
 
-> 早期还有一套原生 HTTP API(`/objects` + `/kv` + HMAC 签名 URL),因「S3 是唯一接入方式」已整体删除;
-> 现在唯一对外接口是 S3(`internal/s3gw`)。
+> An earlier revision also exposed a native HTTP API (`/objects` + `/kv` + HMAC-signed URLs).
+> Because "S3 is the only entry point," that surface was removed entirely; the sole external
+> interface today is S3 (`internal/s3gw`).
 
-## 架构总览
+## Overview
 
 ```
-                 ┌────────────────────── gateway 进程 ──────────────────────┐
-   S3 / OBS SDK  │                                                          │
- ──PUT/GET/DEL─► │  s3gw (gofakes3) ──► object service ──┬──► bbolt (元数据+队列+索引) │
-   (bucket/key)  │  (S3 协议 + 图片处理)   (摄取/读取管线) └──► 本地缓存 (磁盘文件)     │
-                 │                                                          │
-                 │  uploader worker ──(Chain 接口)──► chain backend ─────────┼──► 0G 存储网络
-                 │  (后台单 goroutine，攒批/对账/重试)                        │   (链上 tx + 存储节点)
-                 └──────────────────────────────────────────────────────────┘
+                 ┌────────────────────── gateway process ──────────────────────┐
+   S3 / OBS SDK  │                                                              │
+ ──PUT/GET/DEL─► │  s3gw (gofakes3) ──► object service ──┬──► bbolt (metadata/queues/index) │
+   (bucket/key)  │  (S3 protocol + images) (ingest/read)  └──► local cache (disk files)     │
+                 │                                                              │
+                 │  uploader worker ──(Chain interface)──► chain backend ───────┼──► 0G network
+                 │  (background goroutine: batch/reconcile/retry)               │   (on-chain tx + nodes)
+                 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **s3gw** — S3 协议层(gofakes3 解码 XML/Range/aws-chunked/multipart),把桶+键操作映射到对象服务;前置三个中间件:copy-source 头规范化、华为风格图片处理(`?x-image-process=image/resize,...`)、XML 响应 Content-Type 规范化。
-- **object service** — 上传管线(算哈希/去重/落缓存)、下载(命中缓存或回源 0G)。
-- **store (bbolt)** — 对象元数据 + 两条任务队列 + 桶注册表 + 桶/键→root 索引,**每次状态变更一个事务**。
-- **uploader worker** — 独立后台 goroutine,把队列里的对象批量提交 0G、对账、重试。
-- **chain backend** — 封装 0G SDK,负责真正的上传 / 状态查询 / 带证明的下载。
+- **s3gw** — the S3 protocol layer (gofakes3 decodes XML/Range/aws-chunked/multipart), mapping
+  bucket+key operations onto the object service. Four middlewares run in front of gofakes3:
+  cache backpressure (sheds uploads with `503 SlowDown` when the cache is full of un-evictable
+  data), `X-Amz-Copy-Source` normalization, Huawei-style image processing
+  (`?x-image-process=image/resize,...`), and XML-response Content-Type normalization.
+- **object service** — the ingest pipeline (hash / dedup / cache) and reads (cache hit, or cold
+  restore from 0G).
+- **store (bbolt)** — object metadata, the two task queues, the bucket registry, and the
+  bucket/key → root index. **Every state change is one transaction.**
+- **uploader worker** — a single background goroutine that batches queued objects, submits them
+  to 0G, reconciles, and retries.
+- **chain backend** — wraps the 0G SDK and performs the actual upload, status queries, and
+  proof-verified downloads.
 
-## 数据流
+## Data flow
 
-**上传(写完即可读,上链在后台)**
+**Upload (readable immediately; the upload to 0G happens in the background)**
+
 ```
 PUT /bucket/foo
-  ├─ 流式落临时文件，同时算 SHA256 + MD5(S3 ETag)
-  ├─ 按 SHA 去重：见过的内容直接复用，不重复上链
-  ├─ 算 merkle root → 原子 rename 进本地缓存
-  ├─ 写元数据(pending) + 入「待上传队列」 + 记 bucket/key→root
-  └─► 200                                     ← 此刻已可下载（读本地缓存）
+  ├─ stream to a temp file while computing SHA256 + MD5 (the S3 ETag)
+  ├─ dedup by SHA: already-seen content is reused, never re-uploaded
+  ├─ compute the merkle root → atomic rename into the local cache
+  ├─ write metadata (pending) + enqueue for upload + record bucket/key → root
+  └─► 200                                       ← downloadable now (from the local cache)
 
-     …稍后，后台 worker…
-  攒批 → 一笔链上 tx 提交整批 → onchain → 轮询最终性 → finalized
+     …later, in the background worker…
+  batch → one on-chain tx submits the whole batch → onchain → poll finality → finalized
 ```
 
-**下载(本地优先,缺失回源)**
-```
-GET /bucket/foo ─► 查 bucket/key→root ─► 本地缓存命中？
-                                          ├─ 是：校验大小后直接返回（支持 Range / HEAD）
-                                          └─ 否：从 0G 下载(带 merkle proof) → 写回缓存 → 返回
-```
-
-## 对象生命周期(状态机)
+**Download (local-first, restore on miss)**
 
 ```
-pending ──► submitted ──► onchain ──► finalized   （成功终态）
-（已缓存，  （已交链后端  （tx 已打包，  （存储节点确认）
-  待上传）    待回执）      待最终性）
-   └──────────────────────────────► failed        （重试耗尽 / 被剪除，终态）
-```
-- **崩溃自愈**:任务队列落 bbolt;worker 重启后先对账「submitted/失败」的对象(已上链的用 `SkipTx` 只补分片,没上链的重发 tx)再决定是否重传,不会盲目重复上链。对账时若节点不可达,**跳过本轮、留队列下次重试**,不在状态未知时盲发 tx。
-- **删除**:从桶/键移除映射;0G 上的数据内容寻址、不可物理擦除。
-- `pruned`(被存储节点剪除)是告警态,归档部署需做容量规划。
-
-## 代码结构
-
-```
-cmd/gateway        进程入口、配置装配、优雅退出
-internal/s3gw      S3 协议层(gofakes3 后端)+ 中间件(copy-source / 图片 / XML content-type)
-internal/object    摄取/读取管线(去重、缓存、冷读回源)
-internal/store     bbolt 元数据、上传/最终化队列、桶+键→root 索引
-internal/uploader  后台批量上传 worker(攒批/对账/重试/最终性轮询)
-internal/chain     0G SDK 封装(上传 / 状态查询 / 带证明下载)
-internal/imageproc 图片缩放(纯标准库 image/resize)
-integration        真网 e2e + 华为 OBS SDK(Java/Node.js)兼容测试
+GET /bucket/foo ─► look up bucket/key → root ─► local cache hit?
+                                                 ├─ yes: serve after a size check (Range / HEAD)
+                                                 └─ no:  download from 0G (with merkle proof)
+                                                         → write back to cache → serve
 ```
 
-依赖方向:`s3gw → object → store`;`uploader → store`(+ `Chain` 接口);`chain` 实现 `uploader.Chain` 并被 `main` 注入(`uploader` 不依赖 `chain` 包,靠接口解耦便于 fake 测试)。
+## Object lifecycle
 
-## 设计备忘
+```
+pending ──► submitted ──► onchain ──► finalized   (terminal: success)
+(cached,    (handed to    (tx mined,   (storage nodes confirmed)
+ awaiting    the chain     awaiting
+ upload)     backend)      finality)
+   └──────────────────────────────► failed         (terminal: retries exhausted / pruned)
+```
 
-- **SDK 版本钉死 `v1.4.3-testnet`**:`@latest` 会解析到 v1.3.0,接口不兼容。升级前先核对设计文档。
-- **不用 SDK 的 `Must*` 构造器**:它们出错即 `os.Exit`,会绕过错误返回;统一用返回 error 的版本。
-- **单对象上限默认 4 GiB**(= SDK fragment 大小),保证一对象一 root;更大文件需 manifest 设计,刻意不做。无 multipart 后端(gofakes3 内存攒分片,仅小文件)。
-- **加密(未实现,预留缝)**:若启用网关侧加密,改动点只有两处——`Put` 落缓存前加变换(缓存存密文、root 对密文算)、`Open` 回流前解密;协议须"包装一次、密文为准"。元数据 JSON 存 bbolt,加字段向后兼容。
-- **机密性**:生产将节点 RPC 封进内网(仅网关可达),对齐 OBS 私有桶语义。S3 端点不验签名,只能绑内网。
+- **Crash recovery** — the task queues live in bbolt. After a restart the worker first
+  reconciles `submitted`/failed objects (those already on-chain are completed by re-uploading
+  only their fragments via `SkipTx`; those not on-chain get their tx re-sent) before deciding
+  whether to re-upload — it never blindly re-submits. If a node is unreachable during
+  reconciliation, it **skips this round and leaves the item queued** rather than sending a tx
+  in an unknown state.
+- **Deletion** — removes the bucket/key mapping only; 0G content is content-addressed and
+  cannot be physically erased.
+- **Bounded cache** — the on-disk cache is capped (`cache_max_bytes`). When it grows past the
+  cap, the least-recently-used *finalized* objects' cache files are evicted (they restore from
+  0G on the next read); non-finalized objects are never evicted (their cache file is the only
+  copy). If the cache fills with not-yet-finalized objects, new uploads get a retryable
+  `503 SlowDown` until the upload worker drains the backlog.
+- **`pruned`** (an object dropped by a storage node) is an alarm condition; archival
+  deployments must plan capacity accordingly.
+
+## Code structure
+
+```
+cmd/gateway        process entry point, config loading, graceful shutdown
+internal/s3gw      S3 protocol layer (gofakes3 backend) + middlewares (copy-source / image / XML content-type)
+internal/object    ingest/read pipeline (dedup, cache, cold restore)
+internal/store     bbolt metadata, upload/finalize queues, bucket + key→root index
+internal/uploader  background batch-upload worker (batch / reconcile / retry / finality polling)
+internal/chain     0G SDK wrapper (upload / status query / proof-verified download)
+internal/imageproc image resizing (pure standard-library image/resize)
+integration        live e2e + Huawei OBS SDK (Java/Node.js) compatibility tests
+```
+
+Dependency direction: `s3gw → object → store`; `uploader → store` (plus the `Chain`
+interface); `chain` implements `uploader.Chain` and is injected by `main`. The `uploader`
+package does **not** depend on the `chain` package — they are decoupled through an interface,
+which keeps the worker easy to test with a fake backend.
+
+## Design notes
+
+- **The SDK version is pinned to `v1.4.3-testnet`.** `@latest` resolves to v1.3.0, whose API is
+  incompatible; check the design document before upgrading.
+- **Avoid the SDK's `Must*` constructors** — they call `os.Exit` on error and bypass error
+  returns; always use the error-returning variants.
+- **Default per-object cap is 4 GiB** (the SDK fragment size), guaranteeing one object → one
+  root. Larger files would need a manifest design and are deliberately out of scope. There is
+  no multipart backend (gofakes3 buffers fragments in memory — small files only).
+- **Encryption (not implemented, seam reserved)** — gateway-side encryption would touch only
+  two places: a transform before `Put` writes the cache (cache stores ciphertext, the root is
+  computed over ciphertext) and a decrypt before `Open` streams back; the rule is "wrap once,
+  ciphertext is canonical." Metadata is stored as JSON in bbolt, so new fields stay
+  backward-compatible.
+- **Confidentiality** — in production the node RPCs are confined to an internal network
+  (reachable only by the gateway), matching OBS private-bucket semantics. The S3 endpoint does
+  not verify signatures and must be bound to an internal interface only.

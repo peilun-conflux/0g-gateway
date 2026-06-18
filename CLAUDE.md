@@ -19,8 +19,8 @@ root(`0x…`,服务端生成,天然去重 + 可校验)。桶/键 → root 的映
 
 | 包 | 文件 | 职责 |
 |---|---|---|
-| `cmd/gateway` | `main.go` | 进程入口:读 env 配置、装配各组件、起 S3 server 与后台 worker、优雅退出 |
-| `internal/s3gw` | `backend.go`、`imageprocess.go`、`copysource.go`、`xmlcontenttype.go` | **唯一对外接口**:实现 `gofakes3.Backend`,把 S3 桶+键操作映射到 `object.Service`+`store`;`Wrap` 在 gofakes3 前套三个中间件——`copysource.go`(规范化 `X-Amz-Copy-Source`)、`imageprocess.go`(华为 `?x-image-process=image/resize,...`)、`xmlcontenttype.go`(XML 响应 Content-Type 改 `application/xml`,为 OBS Java SDK)|
+| `cmd/gateway` | `main.go`、`config.go` | 进程入口:`config.go` 读配置(YAML 文件 + env 覆盖,见 §6)、`main.go` 装配各组件、起 S3 server 与后台 worker、优雅退出 |
+| `internal/s3gw` | `backend.go`、`imageprocess.go`、`copysource.go`、`xmlcontenttype.go`、`backpressure.go` | **唯一对外接口**:实现 `gofakes3.Backend`,把 S3 桶+键操作映射到 `object.Service`+`store`;`Wrap` 在 gofakes3 前套四个中间件——`backpressure.go`(最外层,缓存满未 finalized 时对上传回 `503 SlowDown`,见 §9.7)、`copysource.go`(规范化 `X-Amz-Copy-Source`)、`imageprocess.go`(华为 `?x-image-process=image/resize,...`)、`xmlcontenttype.go`(XML 响应 Content-Type 改 `application/xml`,为 OBS Java SDK)|
 | `internal/object` | `service.go` | 摄取/读取管线:spool→sha256(+md5)→去重→merkle root→落缓存→写元数据;冷读回源 |
 | `internal/store` | `store.go` | bbolt 持久化:对象元数据、SHA 索引、两条上传队列、桶注册表 + 桶/键→root 索引;每次状态变更一个事务 |
 | `internal/uploader` | `worker.go` | 后台批量上传 worker:攒批、对账(reconcile)、重试、最终性轮询 |
@@ -40,7 +40,7 @@ root(`0x…`,服务端生成,天然去重 + 可校验)。桶/键 → root 的映
 - `s3_buckets`:`桶名 → BucketRecord(JSON)` —— S3 桶注册表
 - `s3_keys`:`"bucket/key" → root` —— S3 对象索引(纯索引,不碰对象/队列)
 
-`ObjectMeta` 关键字段:`Root, SHA256, MD5, Size, Filename, ContentType, Status, TxHash, FailReason, Retries, SkipTx, CreatedAt, UpdatedAt`。存 JSON,加字段向后兼容。
+`ObjectMeta` 关键字段:`Root, SHA256, MD5, Size, Filename, ContentType, Status, TxHash, FailReason, Retries, SkipTx, CreatedAt, UpdatedAt, LastAccess`。存 JSON,加字段向后兼容。`LastAccess`=最近一次读时间,喂给 finalized-only LRU 缓存淘汰(见 §9.7);`store.Touch` 只更新它、不动 status/UpdatedAt/队列。
 
 **状态机**(`store.Status`):
 ```
@@ -86,7 +86,7 @@ pending ──► submitted ──► onchain ──► finalized
 
 ### 4.4 S3 兼容层(`internal/s3gw` + gofakes3,唯一对外接口)
 为让华为 OBS SDK 等 S3 客户端直接接入(OBS≈S3),用 **gofakes3**(嵌入式库,白嫖 S3 协议:XML/Range/aws-chunked 解码/multipart)+ 我们实现的 `gofakes3.Backend`。
-- 即网关主 server,监听 `ZGS_GW_LISTEN`;`main` 里 `gofakes3.New(s3gw.New(svc,st), WithAutoBucket(true))`,再用 `s3Backend.Wrap(faker.Server())` 套上 S3-compat 中间件栈(copy-source 规范化 + 图片处理)。`Wrap` 是 main 与集成测试共用的唯一中间件装配点,避免漂移。
+- 即网关主 server,监听 `ZGS_GW_LISTEN`;`main` 里 `gofakes3.New(s3gw.New(svc,st), WithAutoBucket(true))`,再用 `s3Backend.Wrap(faker.Server())` 套上 S3-compat 中间件栈(背压 + copy-source 规范化 + 图片处理 + XML content-type)。`Wrap` 是 main 与集成测试共用的唯一中间件装配点,避免漂移。
 - 映射:S3 桶+键 → `store` 的 `s3_buckets`(桶注册表)+ `s3_keys`(`bucket/key`→root 索引);对象字节走 `object.Service.Put/Open`。
 - **ETag=内容 MD5**:PUT 时 gofakes3 自己用 hashingReader 算(我们不算);GET/HEAD 时我们必须回 `Object.Hash`=`meta.MD5`(故 `Service.Put` 在摄取同一遍里多算一个 MD5 存进 `ObjectMeta.MD5`)。
 - `WithAutoBucket(true)`:对不存在的桶 PUT 会自动建桶,兼容「app 假定桶已存在/不显式建桶」。
@@ -100,10 +100,12 @@ pending ──► submitted ──► onchain ──► finalized
 - 缓存文件用内容寻址路径 + 原子 `rename`;冷读临时文件名带随机后缀避免并发撞名。
 - 改动涉及并发路径时**必须** `go test -race`。
 
-## 6. 配置(全部 env,见 `.env.example`)
+## 6. 配置(YAML 文件 + env,装配见 `cmd/gateway/config.go`)
 
-必填:`ZGS_NODES`(逗号分隔存储节点 RPC)、`ZGS_ETH_RPC`(宿主链 RPC)、`ZGS_PRIVATE_KEY`(出证私钥,hex 无 0x)。
-常用可选:`ZGS_GW_LISTEN`(:8080,即对外 S3 端点;不验签名,只能绑内网)、`ZGS_GW_DATA_DIR`(./data)、`ZGS_GW_MAX_SIZE`(默认 4GiB)、`ZGS_GW_BATCH_MAX`(20)、`ZGS_GW_FLUSH_INTERVAL_MS`(3000,必须>0)、`ZGS_GW_MAX_RETRIES`(5)、`ZGS_EXPECTED_REPLICA`(默认=节点数)。
+来源优先级**由低到高**:内置默认 → YAML 文件 → 环境变量(env 永远覆盖文件,便于把 `private_key` 之类机密用 env 注进容器、其余放挂载的 `config.yaml`)。文件路径取自 `--config` / `ZGS_CONFIG`,缺省时存在 `./config.yaml` 即加载;**显式指定但读不到 = 致命错误**,缺省路径不存在则 env-only 运行(向后兼容纯 env 部署)。样例见 `config.example.yaml`(YAML 键名)与 `.env.example`(env 变量名),二者键一一对应。
+
+必填:`nodes`/`ZGS_NODES`(env 为逗号分隔存储节点 RPC)、`eth_rpc`/`ZGS_ETH_RPC`(宿主链 RPC)、`private_key`/`ZGS_PRIVATE_KEY`(出证私钥,hex 无 0x)。
+常用可选:`listen`/`ZGS_GW_LISTEN`(:8080,即对外 S3 端点;不验签名,只能绑内网)、`data_dir`/`ZGS_GW_DATA_DIR`(./data)、`max_size`/`ZGS_GW_MAX_SIZE`(默认 4GiB)、`cache_max_bytes`/`ZGS_GW_CACHE_MAX_BYTES`(默认 10GiB,0=无界;触发 finalized-LRU 淘汰,见 §9.7)、`batch_max`/`ZGS_GW_BATCH_MAX`(20)、`flush_interval_ms`/`ZGS_GW_FLUSH_INTERVAL_MS`(3000,必须>0)、`max_retries`/`ZGS_GW_MAX_RETRIES`(5)、`expected_replica`/`ZGS_EXPECTED_REPLICA`(默认=节点数)。`config_test.go` 覆盖优先级链与错误路径。
 
 ## 7. 构建 / 测试 / 运行
 
@@ -131,12 +133,13 @@ make e2e     # ZGS_E2E=1 真网端到端，需 ZGS_PRIVATE_KEY
 
 ## 9. 维护者必读的坑
 
-1. **内容去重 ⇒ root 多对一**:内容相同 → 同一个 root。多个 S3 桶/键可指向同一 root;**删除只发生在 S3 索引层**(`S3DeleteObjectKey` 只删 `bucket/key→root` 映射,不碰对象本身,也不影响共享同 root 的其它键)。对象一旦摄取,其元数据/缓存/上链永不删除——0G 内容寻址、不可变,数据**不可物理擦除**;有合规擦除需求需单独设计。无「root 级删除」、无「逻辑删除」标志。
+1. **内容去重 ⇒ root 多对一**:内容相同 → 同一个 root。多个 S3 桶/键可指向同一 root;**删除只发生在 S3 索引层**(`S3DeleteObjectKey` 只删 `bucket/key→root` 映射,不碰对象本身,也不影响共享同 root 的其它键)。对象一旦摄取,其**元数据/上链记录永不删除**——0G 内容寻址、不可变,数据**不可物理擦除**;有合规擦除需求需单独设计。无「root 级删除」、无「逻辑删除」标志。(注:**本地缓存文件**会被 finalized-LRU 淘汰——那是可恢复副本,冷读回源,见 §9.7;元数据/0G 副本不受影响。)
 2. **`requeue` 是队列一致性的唯一出口**:清空两条队列后按 status 重新入队。绕过它直接写队列会破坏不变量。
 3. **SkipTx 的 txHash**:一批全是 SkipTx 时 SDK 不发新 tx、返回零 hash;`BatchUpload` 此时返回空串,worker 对 SkipTx 项也传空 txHash,**避免用零 hash 覆盖真实 hash**。
 4. **`FileStatus` 是 any-node 语义**:任一节点报 finalized 即 finalized。曾改成 quorum(需 `ExpectedReplica` 个节点),但因 demo 下单节点滞后会卡死最终化而**回退**。若要改回 quorum,注意默认 `replica=节点数` 会让一个挂掉的节点永久阻塞。
 5. **缓存校验只比大小**:热读只校验文件大小(4GB 对象每次重算 hash 不现实);等长位翻转查不出。冷读从 0G 下载是带 merkle proof 的,完整校验在那一层。
 6. **上传是异步的**:`Put` 返回即 `pending` 且可读(本地缓存);真正上链由 worker 异步完成。别假设返回后已 finalized。
+7. **finalized-only LRU 缓存淘汰 + 背压**(`cache_max_bytes` > 0 时,`object.Service`):缓存超上限时,按 `LastAccess` 淘汰**最久未读的 finalized 对象**的缓存文件(冷读可从 0G 带 proof 取回)。**绝不淘汰未 finalized 对象**——其缓存文件是上链前唯一副本(同 salvage 不变量)。`cacheBytes` 是内存里的尽力计数(启动扫 `objects/` 精确初始化,运行中增删调整,漂移在重启自愈)。当缓存被**不可淘汰的**未 finalized 数据塞满(写入快过上链),新 PUT 由 `s3gw.BackpressureHandler` 中间件(`Wrap` 最外层,在 gofakes3 读 body 前拦)返回 **`503 SlowDown`**(可重试,SDK 自动退避),直到 worker 上链腾出空间。**坑**:LRU 假设「finalized ⇒ 0G 上可取回」;若你的 0G 部署会剪除(prune)已 finalized 数据,则淘汰其缓存后冷读会失败(数据双丢)——归档场景需调大/关掉 `cache_max_bytes` 或保证副本。`service`/`store`/`s3gw` 各有对应 `_test.go`。
 
 ## 10. 已知限制 / 待办(均为有意为之,非 bug)
 
@@ -157,5 +160,7 @@ make e2e     # ZGS_E2E=1 真网端到端，需 ZGS_PRIVATE_KEY
 - `docs/architecture.md` —— 人读的架构总览 + 数据/控制流 + 代码结构 + 设计备忘。
 - `0g-gateway-design.md` —— 原始设计文档(形态 A:OBS→0G 适配层;SDK 真实接口、机密性、Pruner 风险等深入背景)。
 - `docs/migration-from-obs.md` —— 华为 OBS SDK 对接文档(连接配置、实测支持矩阵、图片处理、注意事项)。
-- `docs/接口说明.md` —— 给不懂 0G 的对接方的一页纸 S3 能力/差异说明。
-- `.env.example` —— 配置项清单。
+- `docs/s3-api.md` —— 给不懂 0G 的对接方的一页纸 S3 能力/差异说明。
+- `config.example.yaml` / `.env.example` —— 配置项清单(YAML 键 / env 变量,一一对应)。
+
+> README 与 `docs/` 已统一改为英文(参考标准开源项目);本手册(CLAUDE.md)保持中文。

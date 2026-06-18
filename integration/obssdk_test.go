@@ -31,6 +31,27 @@ type localDL struct{}
 
 func (localDL) Download(_ context.Context, _, _ string) error { return os.ErrNotExist }
 
+// newLocalS3Server stands up the gateway's S3 endpoint backed by a local no-op
+// downloader (no real 0G) — the shared wiring for the OBS SDK compatibility
+// harnesses, using the same middleware stack (b.Wrap) as main.go.
+func newLocalS3Server(t *testing.T) *httptest.Server {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	svc, err := object.New(st, localDL{}, object.Config{DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := s3gw.New(context.Background(), svc, st)
+	faker := gofakes3.New(b, gofakes3.WithAutoBucket(true))
+	ts := httptest.NewServer(b.Wrap(faker.Server()))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
 func TestOBSJavaScriptSDK(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node not on PATH; skipping OBS JS SDK compatibility test")
@@ -40,20 +61,7 @@ func TestOBSJavaScriptSDK(t *testing.T) {
 		t.Skip("esdk-obs-nodejs not installed; run: cd integration/testdata/obs-js && npm install")
 	}
 
-	st, err := store.Open(filepath.Join(t.TempDir(), "meta.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	svc, err := object.New(st, localDL{}, object.Config{DataDir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	b := s3gw.New(context.Background(), svc, st)
-	faker := gofakes3.New(b, gofakes3.WithAutoBucket(true))
-	ts := httptest.NewServer(b.Wrap(faker.Server())) // same middleware stack as main.go
-	defer ts.Close()
+	ts := newLocalS3Server(t)
 
 	cmd := exec.Command("node", script)
 	cmd.Env = append(os.Environ(),

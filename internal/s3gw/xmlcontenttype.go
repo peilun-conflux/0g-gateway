@@ -34,7 +34,12 @@ func (b *Backend) FixXMLContentTypeHandler(next http.Handler) http.Handler {
 
 // isObjectRead reports whether the request is a GET/HEAD of an object key (as
 // opposed to a bucket-level or write operation), using the same path split as
-// the image middleware.
+// the image middleware. It keys off method+path only, not the query string, so
+// it stays true for presigned object GETs (which carry auth query params) and
+// keeps their large bodies on the sendfile fast path. The trade-off: an XML
+// subresource on an object path (e.g. ?uploads, ?versionId) would also be
+// treated as an object read and skip normalization — but this gateway/SDK never
+// issues those (gofakes3 answers them with an XML error, an error path).
 func isObjectRead(r *http.Request) bool {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return false

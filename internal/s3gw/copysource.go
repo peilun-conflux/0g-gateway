@@ -55,11 +55,12 @@ func normalizeCopySource(src string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	dec = strings.TrimPrefix(dec, "/") // a %2F-encoded leading slash decodes to "/"
-	i := strings.IndexByte(dec, '/')
-	if i < 0 || i+1 >= len(dec) {
+	// splitBucketKey strips a leading "/" (covering a %2F-encoded one that decoded
+	// to a literal slash) and enforces a non-empty key — the same split the rest
+	// of the S3 path handling uses.
+	bucket, key, ok := splitBucketKey(dec)
+	if !ok {
 		return "", false
 	}
-	bucket, key := dec[:i], dec[i+1:]
 	return "/" + bucket + "/" + url.QueryEscape(key), true
 }

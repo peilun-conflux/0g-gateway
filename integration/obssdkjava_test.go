@@ -16,18 +16,10 @@
 package integration
 
 import (
-	"context"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
-
-	"github.com/johannesboyne/gofakes3"
-
-	"zgs-gateway/internal/object"
-	"zgs-gateway/internal/s3gw"
-	"zgs-gateway/internal/store"
 )
 
 // workingJDKTool resolves a JDK tool and verifies it actually runs. On macOS,
@@ -64,20 +56,7 @@ func TestOBSJavaSDK(t *testing.T) {
 		t.Fatalf("javac failed: %v\n%s", err, out)
 	}
 
-	st, err := store.Open(filepath.Join(t.TempDir(), "meta.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	svc, err := object.New(st, localDL{}, object.Config{DataDir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	b := s3gw.New(context.Background(), svc, st)
-	faker := gofakes3.New(b, gofakes3.WithAutoBucket(true))
-	ts := httptest.NewServer(b.Wrap(faker.Server())) // same middleware stack as main.go
-	defer ts.Close()
+	ts := newLocalS3Server(t)
 
 	cmd := exec.Command(java, "-cp", classes+string(os.PathListSeparator)+jar, "ObsCompatTest")
 	cmd.Env = append(os.Environ(),

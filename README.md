@@ -100,14 +100,14 @@ aws --endpoint-url http://localhost:8080 s3 cp s3://demo/hello.txt ./out.txt
 ```bash
 make test     # 单元 + 组件级集成（fake 链后端，无网络依赖，秒级；含真实华为 OBS SDK 跑通）
 make lint     # gofmt -l . && go vet ./...
-make e2e      # 真网端到端：需 ZGS_PRIVATE_KEY；PUT→上链→finalized→清缓存→0G 冷读比对
+make e2e      # 真网端到端：需 ZGS_PRIVATE_KEY；真实 OBS SDK 经 HTTP→上链→finalized→清缓存→0G 冷读比对
 ```
 
 ## 代码结构
 
 ```
 cmd/gateway       进程入口、配置装配、优雅退出
-internal/s3gw     S3 协议层（gofakes3 后端）+ 图片处理中间件
+internal/s3gw     S3 协议层（gofakes3 后端）+ 中间件（copy-source 规范化 / 图片处理 / XML content-type）
 internal/object   上传/下载管线
 internal/store    bbolt 元数据、任务队列、桶+键→root 索引
 internal/uploader 后台批量上传 worker

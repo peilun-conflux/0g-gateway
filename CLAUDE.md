@@ -69,8 +69,8 @@ pending ──► submitted ──► onchain ──► finalized
 
 ### 4.2 上传 worker(`uploader.Worker`,后台单 goroutine,`Run` 按 `flushInterval` 循环)
 `Flush`:快照 `q_upload` → 按 `BatchMax` 分批 → `processBatch`:
-- 逐项**重新读库**(快照可能过期),`Deleted` 的跳过(绝不上传)。
-- `submitted`(崩溃残留)或 `Retries>0` 的项,先 `FileStatus` 对账:已 finalized→直接收尾;在链上→置 `SkipTx`;不在链上→清 `SkipTx`。
+- 逐项**重新读库**(快照可能过期,并发 PUT 的 salvage 可能已改写状态)。
+- `submitted`(崩溃残留)或 `Retries>0` 的项,先 `FileStatus` 对账:已 finalized→直接收尾;在链上→置 `SkipTx`;不在链上→清 `SkipTx`;**对账失败(节点不可达)→跳过本轮、留队列下次重试,绝不在状态未知时盲目重发 tx(防重复上链/多花 gas)**。
 - 全部置 `submitted` → `ch.BatchUpload`(一次链上 tx 提交整批)。
   - 成功:置 `onchain`;**SkipTx 项保留原 txHash**(传空,不被本批 hash 覆盖,见 §9)。
   - 失败:`reconcileFailedBatch` 逐项对账,涨 `Retries`,超过 `MaxRetries` 置 `failed`,否则回 `pending`。

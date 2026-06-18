@@ -153,7 +153,8 @@ make e2e     # ZGS_E2E=1 真网端到端，需 ZGS_PRIVATE_KEY
 
 ## 11. 文档地图
 
-- `README.md` —— 人读的简洁架构 + 数据/控制流。
+- `README.md` —— 部署 / 使用 / 配置 + 文档导航(不含架构细节)。
+- `docs/architecture.md` —— 人读的架构总览 + 数据/控制流 + 代码结构 + 设计备忘。
 - `0g-gateway-design.md` —— 原始设计文档(形态 A:OBS→0G 适配层;SDK 真实接口、机密性、Pruner 风险等深入背景)。
 - `docs/migration-from-obs.md` —— 华为 OBS SDK 对接文档(连接配置、实测支持矩阵、图片处理、注意事项)。
 - `docs/接口说明.md` —— 给不懂 0G 的对接方的一页纸 S3 能力/差异说明。

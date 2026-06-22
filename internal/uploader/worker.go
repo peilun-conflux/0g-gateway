@@ -218,10 +218,12 @@ func (w *Worker) PollFinality(ctx context.Context) error {
 //
 // There is deliberately no panic recovery. An unrecovered panic in this
 // goroutine aborts the whole process (Go crashes on any unrecovered goroutine
-// panic) — the intended fail-fast for the demo, so a worker bug surfaces loudly
-// with a stack trace instead of being swallowed while uploads silently stop.
-// For production, wrap the loop body in recover()+log+continue so a transient
-// panic doesn't take the gateway down.
+// panic) — the intended fail-fast, so a worker bug surfaces loudly with a stack
+// trace instead of being swallowed while uploads silently stop. Known panics are
+// fixed at their source, not masked here: the 0G SDK's util.Reminder would panic
+// by logging at PanicLevel while a node lagged, which chain.New now prevents by
+// pinning the uploader's log level. A recover() here would only have hidden that
+// (and any future SDK panic) while the upload still made no progress.
 //
 // Neither fail-fast nor recovery catches a *hang*: if Flush blocks forever (a
 // stuck node RPC with no per-op timeout) the goroutine never panics or returns,

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 
+	zg_common "github.com/0gfoundation/0g-storage-client/common"
 	"github.com/0gfoundation/0g-storage-client/common/blockchain"
 	"github.com/0gfoundation/0g-storage-client/core"
 	"github.com/0gfoundation/0g-storage-client/node"
@@ -16,6 +17,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/openweb3/web3go"
+	"github.com/sirupsen/logrus"
 
 	"zgs-gateway/internal/uploader"
 )
@@ -55,7 +57,22 @@ func New(ctx context.Context, opt Options) (*Backend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect eth rpc: %w", err)
 	}
-	up, closer, err := transfer.NewUploaderFromConfig(ctx, w3, transfer.UploaderConfig{Nodes: opt.Nodes})
+	// Pin the SDK uploader's log level. While waiting for a storage node to sync
+	// an uploaded log entry, the SDK "reminds" via util.Reminder, whose
+	// sub-interval branch logs at the uploader logger's *own* level (reminder.go).
+	// A zero-value UploaderConfig.LogOption makes the SDK's NewLogger call
+	// SetLevel(LogOption.LogLevel) — and logrus.Level's zero value is 0 ==
+	// PanicLevel. So an unconfigured uploader logs its "log entry unavailable yet"
+	// reminder at PanicLevel, and logrus panics when logging at PanicLevel; with
+	// the worker's deliberate fail-fast (no recover), that crashed the whole
+	// gateway whenever a node lagged in sync. InfoLevel keeps the wait visible
+	// rather than hidden (routine waits at Info; the SDK escalates a wait past its
+	// interval to Warn on its own) and is never Panic/Fatal, so the reminder
+	// degrades to a log line and the upload rides out the lag.
+	up, closer, err := transfer.NewUploaderFromConfig(ctx, w3, transfer.UploaderConfig{
+		Nodes:     opt.Nodes,
+		LogOption: zg_common.LogOption{LogLevel: logrus.InfoLevel},
+	})
 	if err != nil {
 		w3.Close()
 		return nil, fmt.Errorf("create uploader: %w", err)
